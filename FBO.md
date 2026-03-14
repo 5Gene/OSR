@@ -1,15 +1,19 @@
 下面是**更新后的完整方案文档**。
 核心变化：
 
-* **Session 移入 `source{}` 作用域**
+* **统一入口与策略模式**：入口为 `OSR.recorder(context) { }`，通过 `presentation { }` 或 `fbo { }` 选择渲染策略，Session 由策略内部创建并注入到
+  UI（FBO 策略下通过 `source { session -> }`）。
+* **Session 移入 `source{}` 作用域**（FBO 策略）
 * UI 在创建时即可拿到 **Session**
-* UI 内部直接控制 **start / stop**
-* **不使用 Presentation**
-* **不使用 MediaProjection**
+* UI 内部直接控制 **startRecord / stopRecord**
+* **FBO 策略下**不使用 Presentation、不使用 MediaProjection
 * 支持 **View / MapView**
 * 支持 **Filter 扩展（示例：水波滤镜）**
-* 架构符合 **SOLID + Clean Architecture**
+* 架构符合 **SOLID + Clean Architecture**，采用 **策略模式**（RenderStrategy）与公共层 + 实现层分离
 * 并发模型 **Kotlin 协程**
+
+**文档定位**：本文档描述 **FBO 渲染策略** 的详细设计。库同时支持 **Presentation 策略**（已实现，见 IMPLEMENTATION_SUMMARY），两者均实现
+`RenderStrategy`，由扩展函数注入 `RecorderConfig`。
 
 本文档用于 **指导大模型生成代码**。
 
@@ -67,30 +71,52 @@ Session
 
 # 二、关键技术约束
 
-系统必须满足：
+FBO 策略下必须满足：
 
-不使用
+* 不使用 **MediaProjection**
+* 不使用 **Presentation / VirtualDisplay**
 
-MediaProjection
+视频由 **GPU 离屏渲染** 生成（View/MapView → 纹理 → FBO → 编码）。
 
-不使用
+---
 
+# 三、策略模式架构
+
+库采用 **策略模式**：公共层只依赖 `RenderStrategy` 接口，不依赖具体渲染实现；Presentation 与 FBO 各自实现该接口，通过扩展函数注入配置。
+
+**入口**：`OSR.recorder(context) { block }` 或 `OSR.recorder(context, config)`。`block` 内配置 `video {}`、`audio {}`、`output {}`、
+`listener {}`，以及 **必须二选一** 的渲染策略：`presentation { display, session -> }` 或 `fbo { }`。
+
+**流程**：配置完成后，OSR 校验 `RecorderConfig`（含 `renderStrategy != null`），然后调用
+`config.renderStrategy!!.createSession(context, config)` 得到 `RecorderSession`。调用方在协程中拿到已准备好的 Session（FBO 策略下 Session
+会注入到 `fbo { source { session -> } }` 的 lambda 中供 View/MapView 使用）。
+
+**RenderStrategy 接口**（见 `osp.osr.render.RenderStrategy`）：
+
+```kotlin
+interface RenderStrategy {
+    suspend fun createSession(context: Context, config: RecorderConfig): RecorderSession
+}
 ```
-Presentation
-VirtualDisplay
-```
 
-视频生成流程：
+Presentation 与 FBO 各自实现该接口；通过 `RecorderConfig.presentation { }` / `RecorderConfig.fbo { }` 扩展函数注入，公共层不依赖 pres 或
+fbo 包。
 
-```
-GPU离屏渲染
+架构关系：
+
+```mermaid
+flowchart LR
+    OSR --> RecorderConfig
+    RecorderConfig -->|renderStrategy| RenderStrategy
+    RenderStrategy -->|createSession| PresentationRecorderSession
+    RenderStrategy -->|createSession| FboRecorderSession
 ```
 
 ---
 
-# 三、整体架构
+# 四、整体架构
 
-渲染管线：
+**FBO 渲染管线**（本策略内部）：
 
 ```
 FrameSource
@@ -114,55 +140,33 @@ MediaCodec
 MP4
 ```
 
-模块结构：
-
-```
-api
-session
-source
-renderer
-filter
-encoder
-event
-config
-core
-```
-
-模块职责：
-
-```
-api        外部调用
-session    生命周期控制
-source     UI画面输入
-renderer   GPU渲染
-filter     滤镜系统
-encoder    视频编码
-event      事件系统
-config     参数配置
-core       核心调度
-```
+**模块分层**：公共层（api、session 接口、config、render 接口、core）由 OSR 与 Presentation 策略共用；FBO 策略实现层（fbo 包）包含
+source、renderer、filter 等，复用 core 的 encoder/muxer。详见第二十一节。
 
 ---
 
-# 四、Session 设计
+# 五、Session 设计
 
-Session 控制录制生命周期。
+Session 控制录制生命周期，与公共层接口一致（见 `osp.osr.RecorderSession`）。FBO 策略下由 `FboRecorderSession` 实现，在 `createSession` 时根据
+`fbo { source { session -> } }` 将 session 注入给 View/MapView。
 
 接口：
 
 ```kotlin
 interface RecorderSession {
 
-    fun start()
+    fun startRecord()
 
-    fun pause()
+    fun stopRecord()
 
-    fun resume()
+    fun release()
 
-    fun stop()
+    fun getState(): RecorderState
 
 }
 ```
+
+状态枚举 `RecorderState`（见 `osp.osr.model.RecorderState`）：`IDLE`、`PREPARED`、`RECORDING`、`STOPPING`、`RELEASED`。
 
 Session 特点：
 
@@ -174,58 +178,52 @@ UI可直接调用
 
 ---
 
-# 五、使用方式设计
+# 六、使用方式设计
 
-## Builder + DSL
+## 统一入口 OSR + DSL
 
-核心 API：
+入口为 **OSR**：`OSR.recorder(context) { }`（suspend，需在协程作用域调用，如 `lifecycleScope.launch { }`）。配置项与公共层 `RecorderConfig`
+一致：`video { }`、`audio { }`、`output { }`、`listener { }`，以及渲染策略。FBO 路径使用 `fbo { }`，其内可写 `source { session -> }`、
+`filters { }` 等。
+
+核心 API 示例：
 
 ```kotlin
-val recorder = OffscreenRecorder.builder(context) {
+lifecycleScope.launch {
 
-    video {
+    val session = OSR.recorder(context) {
 
-        width = 1080
-        height = 1920
-        fps = 30
-        bitrate = 8_000_000
-        output = "/sdcard/demo.mp4"
+        video {
+            width = 1080
+            height = 1920
+            fps = 30
+            bitrate = 8_000_000
+        }
+        output { file = File("/sdcard/demo.mp4") }
+        audio { file = File("/sdcard/demo.aac") }  // 可选
+        listener { onStart = { }; onSaved = { file -> } }
 
-    }
-    //可选配置
-    audio {
-        input = "/sdcard/demo.aac"
-    }
-    filters {
-
-        add(WaveFilter())
-
-    }
-
-    source { session ->
-
-        view {
-
-            AnimView(context, session)
-
+        fbo {
+            source { s ->
+                view { AnimView(context, s) }
+            }
+            filters { add(WaveFilter()) }
         }
 
     }
-
+    // session 已 prepare 完成，可由 UI 调用 startRecord() / stopRecord()
 }
 ```
 
-准备：
-
-```
-recorder.prepare()
-```
+FBO 策略下 `createSession` 内部完成 prepare，调用方拿到的即是已准备好的 `RecorderSession`（与 Presentation 策略一致）。也可使用 Builder：
+`RecorderConfig.Builder().setVideoSize(1080, 1920).setOutputFile(...).setRenderStrategy(FboStrategy(...)).build()`，再
+`OSR.recorder(context, config)`。
 
 ---
 
-# 六、View 使用方式
+# 七、View 使用方式
 
-UI 创建时直接拿到 Session。
+UI 创建时直接拿到 Session（由 FBO 策略在 `source { session -> }` 中注入），接口为 `startRecord()`、`stopRecord()`、`release()`、`getState()`。
 
 示例：
 
@@ -236,113 +234,77 @@ class AnimView(
 ) : View(context) {
 
     private val paint = Paint()
-
     var radius = 50f
 
     override fun onDraw(canvas: Canvas) {
-
         canvas.drawCircle(200f, 200f, radius, paint)
-
     }
 
     fun startAnimation() {
-
-        session.start()
-
+        session.startRecord()
         ValueAnimator.ofFloat(50f, 200f).apply {
-
             duration = 2000
-
             addUpdateListener {
-
                 radius = it.animatedValue as Float
                 invalidate()
-
             }
-
-            doOnEnd {
-
-                session.stop()
-
-            }
-
+            doOnEnd { session.stopRecord() }
         }.start()
-
     }
-
 }
 ```
 
-使用：
+使用（在 `fbo { }` 内通过 `source { session -> }` 注入）：
 
 ```kotlin
-source { session ->
-
-    view {
-
-        AnimView(context, session)
-
+fbo {
+    source { session ->
+        view { AnimView(context, session) }
     }
-
 }
 ```
 
 ---
 
-# 七、MapView 使用方式
+# 八、MapView 使用方式
 
-例如使用：
-
-AMap Android SDK
+例如使用 AMap Android SDK。Session 方法统一为 `startRecord()`、`stopRecord()` 等。
 
 示例：
 
 ```kotlin
 class MapController(
-
     val mapView: MapView,
     val session: RecorderSession
-
 ) {
-
     fun startRouteDemo() {
-
-        session.start()
-
+        session.startRecord()
         playRoute()
-
     }
-
     fun endRouteDemo() {
-
-        session.stop()
-
+        session.stopRecord()
     }
-
 }
 ```
 
-Recorder：
+Recorder（在 `fbo { }` 内）：
 
 ```kotlin
-source { session ->
-
-    map {
-
-        MapController(mapView, session)
-
-        mapView
-
+fbo {
+    source { session ->
+        map {
+            MapController(mapView, session)
+            mapView
+        }
     }
-
 }
 ```
 
 ---
 
-# 八、Source 设计
+# 九、Source 设计
 
-Source 是 UI 输入入口。
+Source 是 UI 输入入口，由 FBO 策略的 Session（FboRecorderSession）与 `source { }` 配置协作创建。
 
 接口：
 
@@ -366,9 +328,9 @@ GLRendererSource
 
 ---
 
-# 九、ViewSource 实现
+# 十、ViewSource 实现
 
-原理：
+由 FboRecorderSession 根据 `fbo { source { view { } } }` 配置创建。原理：
 
 ```
 View.draw(Canvas)
@@ -406,9 +368,9 @@ class ViewSource(
 
 ---
 
-# 十、MapSource 实现
+# 十一、MapSource 实现
 
-MapView 底层：
+由 FboRecorderSession 根据 `fbo { source { map { } } }` 配置创建。MapView 底层：
 
 ```
 TextureView
@@ -445,9 +407,9 @@ class MapSource(
 
 ---
 
-# 十一、Renderer 设计
+# 十二、Renderer 设计
 
-Renderer 负责：
+由 FboRecorderSession 编排，负责：
 
 ```
 获取画面
@@ -475,7 +437,7 @@ GLRenderer
 
 ---
 
-# 十二、Filter 系统
+# 十三、Filter 系统
 
 Filter Pipeline：
 
@@ -510,7 +472,7 @@ interface Filter {
 
 ---
 
-# 十三、水波滤镜示例
+# 十四、水波滤镜示例
 
 滤镜：
 
@@ -555,7 +517,7 @@ uv.y += sin(uv.x * 20.0 + time) * 0.02
 
 ---
 
-# 十四、FilterPipeline
+# 十五、FilterPipeline
 
 实现：
 
@@ -589,9 +551,9 @@ class FilterPipeline {
 
 ---
 
-# 十五、Encoder 模块
+# 十六、Encoder 模块
 
-编码基于：
+FBO 策略复用公共层 core 的 MediaCodec 与 Muxer（EncoderController、MuxerController）。编码基于：
 
 ```
 MediaCodec
@@ -620,7 +582,7 @@ MuxerController
 
 ---
 
-# 十六、协程架构
+# 十七、协程架构
 
 所有并发使用协程。
 
@@ -655,97 +617,42 @@ while (recording) {
 
 ---
 
-# 十七、事件监听系统
+# 十八、事件监听系统
 
-监听接口：
-
-```kotlin
-interface RecorderListener {
-
-    fun onStart()
-
-    fun onFrame(frameIndex: Long, timestamp: Long)
-
-    fun onPause()
-
-    fun onResume()
-
-    fun onStop()
-
-    fun onComplete(path: String)
-
-    fun onError(error: Throwable)
-
-}
-```
+与公共层 `ListenerConfig` 一致（见 `osp.osr.listener.ListenerConfig`），按需赋值回调。
 
 DSL：
 
 ```kotlin
 listener {
-
-    onStart {}
-
-    onFrame { frame, time -> }
-
-    onComplete { path -> }
-
+    onStart = { }
+    onStop = { }
+    onSaved = { file -> }
+    onError = { e -> }
 }
 ```
 
 ---
 
-# 十八、配置系统
+# 十九、配置系统
 
-统一配置：
-
-```
-RecorderConfig
-```
-
-子配置：
-
-```
-VideoConfig
-EncoderConfig
-RenderConfig
-FilterConfig
-```
+统一配置为公共层 `RecorderConfig`（见 `osp.osr.dsl.RecorderConfig`），含 `videoConfig`、`audioConfig`、`outputConfig`、`listenerConfig`
+及由扩展函数注入的 `renderStrategy`。FBO 策略在 `fbo { }` 块内可扩展 source、filters 等。子配置包括 `VideoConfig`、`AudioConfig`、
+`OutputConfig` 等。
 
 示例：
 
 ```kotlin
-data class VideoConfig(
-
-    val width: Int,
-    val height: Int,
-    val fps: Int,
-    val bitrate: Int
-
-)
+// VideoConfig 在 RecorderConfig 内
+video { width = 1080; height = 1920; fps = 30; bitrate = 4_000_000 }
 ```
 
 ---
 
-# 十九、状态机
+# 二十、状态机
 
-状态：
-
-```
-Idle
-Preparing
-Prepared
-Recording
-Paused
-Stopping
-Completed
-```
-
-控制：
-
-```
-RecorderStateMachine
-```
+状态与 `RecorderState` 一致：`IDLE`、`PREPARED`、`RECORDING`、`STOPPING`、`RELEASED`。FboRecorderSession 内部用状态机（如 `AtomicReference` +
+CAS）控制转换。
 
 保证：
 
@@ -756,40 +663,42 @@ RecorderStateMachine
 
 ---
 
-# 二十、模块结构
+# 二十一、模块结构
 
-最终模块：
+**公共层**（与 Presentation 策略共用）：
 
 ```
-offscreen-recorder
- ├─ api
- ├─ session
- ├─ source
- ├─ renderer
- ├─ filter
- ├─ encoder
- ├─ event
- ├─ config
- └─ core
+osp.osr
+ ├─ api          (OSR 入口)
+ ├─ session      (RecorderSession 接口)
+ ├─ config       (RecorderConfig、VideoConfig 等)
+ ├─ render       (RenderStrategy 接口)
+ ├─ listener     (ListenerConfig)
+ ├─ model        (RecorderState、EncodedFrame、RecorderError 等)
+ └─ core         (encoder、muxer、audio)
+```
+
+**策略实现层**：`pres`（Presentation 策略，已实现）、**fbo**（FBO 策略，本文档重点）。FBO 策略包（如 `osp.osr.fbo`）下含：
+
+```
+fbo
+ ├─ session      (FboRecorderSession 实现)
+ ├─ source       (ViewSource、MapSource、FrameSource)
+ ├─ renderer     (FrameRenderer 及实现)
+ ├─ filter       (Filter、FilterPipeline、WaveFilter 等)
+ └─ 复用 core    (encoder、muxer)
 ```
 
 依赖关系：
 
 ```
-api
- ↓
-session
- ↓
-core
- ↓
-renderer
- ↓
-encoder
+api → config + render(接口) → 各策略实现(pres / fbo)
+FBO 策略内部：FboRecorderSession → core + source + renderer + filter
 ```
 
 ---
 
-# 二十一、最终能力
+# 二十二、最终能力
 
 库最终支持：
 
@@ -804,10 +713,9 @@ Session 控制录制
 系统特点：
 
 ```
-不使用 MediaProjection
-不使用 Presentation
+FBO 策略下不使用 MediaProjection / Presentation
 高性能 GPU 渲染
 可扩展滤镜
-模块化架构
+策略模式 + 模块化架构
 协程并发
 ```

@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.osc.demo"
+    namespace = "com.osr.demo"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -41,6 +41,7 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.appcompat)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
@@ -55,7 +56,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.amap3d)
-    implementation(project(":osc"))
+    implementation(project(":osr"))
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

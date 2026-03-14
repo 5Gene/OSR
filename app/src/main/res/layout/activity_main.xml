@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <com.osr.demo.ui.components.MapTrackView
+        android:id="@+id/mapTrackView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <Button
+        android:layout_width="wrap_content"
+        android:text="录制"
+        android:onClick="record"
+        android:layout_marginTop="20dp"
+        android:layout_height="wrap_content" />
+</FrameLayout>

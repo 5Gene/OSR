@@ -23,6 +23,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "OSC"
+rootProject.name = "OSR"
 include(":app")
-include(":osc")
+include(":osr")
