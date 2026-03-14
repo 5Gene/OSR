@@ -33,6 +33,7 @@ dependencies {
     implementation(libs.material)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.amap3d)
 
     testImplementation(libs.junit)
