@@ -9,11 +9,14 @@ import android.widget.Button
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import com.osr.demo.ui.components.ColorChangeView
 import com.osr.demo.ui.components.MapTrackView
+import com.osr.demo.ui.presentation.ColorChangePresentation
 import com.osr.demo.ui.presentation.MapTrackPresentation
 import kotlinx.coroutines.launch
 import osp.osr.OSR
 import osp.osr.RecorderSession
+import osp.osr.fbo.fbo
 import osp.osr.pres.presentation
 import java.io.File
 import java.text.SimpleDateFormat
@@ -129,6 +132,15 @@ class MainActivity : AppCompatActivity() {
                         MapTrackPresentation(this@MainActivity, display, session)
 //                        ColorChangePresentation(this@MainActivity, display, session)
                     }
+//                    fbo {
+//                        view { session ->
+//                            ColorChangeView(this@MainActivity).apply {
+//                                onStart = { session.startRecord() }
+//                                onEnd = { session.stopRecord() }
+//                                start()
+//                            }
+//                        }
+//                    }
                 }
                 recorderSession = newSession
             } catch (e: Exception) {
