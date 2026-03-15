@@ -30,7 +30,8 @@ class OffscreenSource(
     private val captureCallback: FrameCaptureCallback,
     private val width: Int,
     private val height: Int,
-    private val fps: Int
+    private val fps: Int,
+    private val glInit: (() -> Unit)? = null
 ) : FrameSource {
 
     private val eglHelper = EglHelper()
@@ -49,6 +50,8 @@ class OffscreenSource(
 
             renderer.onSurfaceCreated(null, null)
             renderer.onSurfaceChanged(null, width, height)
+
+            glInit?.invoke()
 
             val frameIntervalMs = 1000L / fps
             OsrLog.i("OffscreenSource: render loop started ${width}x${height} @${fps}fps")

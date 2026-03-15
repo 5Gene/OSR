@@ -33,11 +33,12 @@ import osp.osr.log.OsrLog
  * **V2（PBO）**：使用 [PboTextureUploader] 经 PBO 上传，减轻 CPU→GPU 同步阻塞，高分辨率下更稳。
  */
 class ViewSource(
-    private val viewProvider: () -> View,
+    private val viewProvider: View,
     private val captureCallback: FrameCaptureCallback,
     private val width: Int,
     private val height: Int,
-    private val fps: Int
+    private val fps: Int,
+    private val glInit: (() -> Unit)? = null
 ) : FrameSource {
 
     private val eglHelper = EglHelper()
@@ -73,6 +74,8 @@ class ViewSource(
             firstFrame = true
             pboUploader = PboTextureUploader()
 
+            glInit?.invoke()
+
             val frameIntervalMs = 1000L / fps
             OsrLog.i("ViewSource: render loop started ${width}x${height} @${fps}fps")
 
@@ -90,9 +93,8 @@ class ViewSource(
     }
 
     private suspend fun drawViewToBitmap() = withContext(Dispatchers.Main) {
-        val view = viewProvider()
         canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
-        view.draw(canvas)
+        viewProvider.draw(canvas)
     }
 
     private fun uploadBitmapToTexture() {

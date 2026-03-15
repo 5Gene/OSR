@@ -1,5 +1,7 @@
 package osp.osr.fbo
 
+import android.app.ActivityManager
+import android.content.Context
 import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
@@ -43,7 +45,8 @@ class FrameCaptureRenderer(
     private val height: Int,
     encoderSurface: Surface,
     private val filterPipeline: FilterPipeline,
-    private val skipEglRestore: Boolean = false
+    private val skipEglRestore: Boolean = false,
+    private val context: Context? = null
 ) : FrameCaptureCallback, SourceSizeSink {
 
     @Volatile
@@ -214,10 +217,17 @@ class FrameCaptureRenderer(
     private fun checkGles30Support() {
         val version = IntArray(2)
         GLES30.glGetIntegerv(GLES30.GL_MAJOR_VERSION, version, 0)
-        if (version[0] < 3) {
-            val msg = "FBO recording requires OpenGL ES 3.0+, current: ${version[0]}"
+        if (version[0] >= 3) return
+        if (version[0] == 0 && context != null) {
+            val reqGlEs = (context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager)
+                ?.deviceConfigurationInfo?.reqGlEsVersion ?: 0
+            if (reqGlEs >= 0x30000) return
+            val msg = "FBO recording requires OpenGL ES 3.0+, device reports: 0x${Integer.toHexString(reqGlEs)}"
             OsrLog.e("FrameCaptureRenderer: $msg")
             throw RuntimeException(msg)
         }
+        val msg = "FBO recording requires OpenGL ES 3.0+, current: ${version[0]}"
+        OsrLog.e("FrameCaptureRenderer: $msg")
+        throw RuntimeException(msg)
     }
 }

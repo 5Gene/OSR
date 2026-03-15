@@ -59,6 +59,7 @@ internal class FboRecorderSession(
     private var frameSource: FrameSource? = null
     private var captureRenderer: FrameCaptureRenderer? = null
     private val filterPipeline = FilterPipeline()
+    private var isOffscreenMode = false
 
     /**
      * 🛠️ 搭好管线：滤镜、编码器、Muxer、音频（可选）、根据 sourceConfig 创建 FrameSource + FrameCaptureRenderer。
@@ -93,13 +94,15 @@ internal class FboRecorderSession(
             // 方式 3/4 没有「宿主 GL 线程」需要恢复，skipEglRestore=true 避免无效的 eglMakeCurrent
             val isOffscreen = sourceConfig is FrameSourceConfig.Offscreen
                     || sourceConfig is FrameSourceConfig.ViewCapture
+            isOffscreenMode = isOffscreen
 
             val renderer = FrameCaptureRenderer(
                 width = w,
                 height = h,
                 encoderSurface = surface,
                 filterPipeline = filterPipeline,
-                skipEglRestore = isOffscreen
+                skipEglRestore = isOffscreen,
+                context = context
             )
             captureRenderer = renderer
 
@@ -118,15 +121,16 @@ internal class FboRecorderSession(
 
                 is FrameSourceConfig.Offscreen -> {
                     val userRenderer = sourceConfig.factory(session)
-                    OffscreenSource(userRenderer, renderer, w, h, fps)
+                    OffscreenSource(userRenderer, renderer, w, h, fps, glInit = { captureRenderer?.initGL() })
                 }
 
                 is FrameSourceConfig.ViewCapture -> {
-                    var cachedView: View? = null
+                    var cachedView: View = sourceConfig.factory(session)
                     ViewSource(
-                        viewProvider = { cachedView ?: sourceConfig.factory(session).also { cachedView = it } },
+                        viewProvider = cachedView,
                         captureCallback = renderer,
-                        width = w, height = h, fps = fps
+                        width = w, height = h, fps = fps,
+                        glInit = { captureRenderer?.initGL() }
                     )
                 }
             }
@@ -150,8 +154,8 @@ internal class FboRecorderSession(
         checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
 
         try {
-            // 必须在 GL 线程调；方式 1/2 是宿主 GL 线程，方式 3/4 是 OffscreenSource/ViewSource 的协程里先 makeCurrent 再调
-            captureRenderer?.initGL()
+            // 方式 1/2：必须在 GL 线程调 initGL；方式 3/4 在 ViewSource/OffscreenSource 协程里 makeCurrent 后再调
+            if (!isOffscreenMode) captureRenderer?.initGL()
 
             encoderController.start()
             encoderController.launchEncoderLoop(
