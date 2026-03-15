@@ -54,9 +54,10 @@ class EglSurfaceManager(
         val surfaceAttribs = intArrayOf(EGL14.EGL_NONE)
         eglSurface = EGL14.eglCreateWindowSurface(display, configs[0]!!, encoderSurface, surfaceAttribs, 0)
         if (eglSurface == EGL14.EGL_NO_SURFACE) {
+            OsrLog.e("EglSurfaceManager: eglCreateWindowSurface failed for encoder")
             throw RuntimeException("eglCreateWindowSurface failed for encoder")
         }
-        OsrLog.d("EglSurfaceManager: encoder EGLSurface created")
+        OsrLog.i("EglSurfaceManager: encoder EGLSurface created")
     }
 
     /**
@@ -77,7 +78,7 @@ class EglSurfaceManager(
     }
 
     fun release() {
+        OsrLog.i("EglSurfaceManager: release")
         EGL14.eglDestroySurface(display, eglSurface)
-        OsrLog.d("EglSurfaceManager: released")
     }
 }

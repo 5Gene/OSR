@@ -31,7 +31,8 @@ class CaptureRendererSource(
         }
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
-            OsrLog.d("CaptureRendererSource: onSurfaceChanged ${width}x${height}")
+            (captureCallback as? SourceSizeSink)?.setSourceSize(width, height)
+            OsrLog.i("CaptureRendererSource: onSurfaceChanged ${width}x${height}")
         }
 
         /** 每帧画完时 GL 线程回调这里；我们在这时把「当前画面」交给 FrameCaptureRenderer 去拷 FBO、走滤镜、写编码器 */

@@ -32,7 +32,8 @@ class GLSurfaceViewSource(
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
             userRenderer.onSurfaceChanged(gl, width, height)
-            OsrLog.d("GLSurfaceViewSource: onSurfaceChanged ${width}x${height}")
+            (captureCallback as? SourceSizeSink)?.setSourceSize(width, height)
+            OsrLog.i("GLSurfaceViewSource: onSurfaceChanged ${width}x${height}")
         }
 
         /** 先让你的画面画完（上屏），再录这一帧 */

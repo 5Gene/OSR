@@ -2,6 +2,7 @@ package osp.osr.fbo
 
 import android.opengl.GLSurfaceView
 import android.view.View
+import osp.osr.RecorderSession
 import osp.osr.dsl.RecorderDsl
 import osp.osr.fbo.filter.Filter
 
@@ -13,19 +14,26 @@ import osp.osr.fbo.filter.Filter
  */
 sealed interface FrameSourceConfig {
     /** 方式 1：你把「我们的 Renderer」通过 attach 挂到地图/自定义 GL 环境，每帧 onDrawFrame 时我们录一帧 */
-    data class CaptureRenderer(val attach: (GLSurfaceView.Renderer) -> Unit) : FrameSourceConfig
+    data class CaptureRenderer(
+        val attach: (GLSurfaceView.Renderer, RecorderSession) -> Unit
+    ) : FrameSourceConfig
 
     /** 方式 2：你提供 GLSurfaceView + 自己的 Renderer，我们包一层装饰器，边显示边录 */
     data class GlSurfaceView(
         val surface: GLSurfaceView,
-        val renderer: GLSurfaceView.Renderer
+        val renderer: GLSurfaceView.Renderer,
+        val onSessionReady: ((RecorderSession) -> Unit)? = null
     ) : FrameSourceConfig
 
     /** 方式 3：纯后台，只传 Renderer，我们在离屏 EGL 里循环调 onDrawFrame 并录 */
-    data class Offscreen(val renderer: GLSurfaceView.Renderer) : FrameSourceConfig
+    data class Offscreen(
+        val factory: (RecorderSession) -> GLSurfaceView.Renderer
+    ) : FrameSourceConfig
 
     /** 方式 4：任意 View，我们主线程 draw 到 Bitmap，GL 线程上传纹理再录 */
-    data class ViewCapture(val provider: () -> View) : FrameSourceConfig
+    data class ViewCapture(
+        val factory: (RecorderSession) -> View
+    ) : FrameSourceConfig
 }
 
 // ─── 📋 FBO DSL 入口 ───
@@ -41,32 +49,36 @@ class FboConfig {
 
     private fun requireSourceNotSet() {
         require(sourceConfig == null) {
-            "只能选择一种录制模式（captureRenderer / glSurfaceView / renderer / view）"
+            "只能选择一种录制模式（renderer / glSurfaceView / offscreen / view）"
         }
     }
 
     /** 方式 1：高德/腾讯 setCustomRenderer 场景，你把我们的 Renderer 传进去 */
-    fun captureRenderer(attach: (GLSurfaceView.Renderer) -> Unit) {
+    fun renderer(attach: (GLSurfaceView.Renderer, RecorderSession) -> Unit) {
         requireSourceNotSet()
         sourceConfig = FrameSourceConfig.CaptureRenderer(attach)
     }
 
     /** 方式 2：边显示边录，surface 上绑我们包装过的 renderer */
-    fun glSurfaceView(surface: GLSurfaceView, renderer: GLSurfaceView.Renderer) {
+    fun glSurfaceView(
+        surface: GLSurfaceView,
+        renderer: GLSurfaceView.Renderer,
+        onSessionReady: ((RecorderSession) -> Unit)? = null
+    ) {
         requireSourceNotSet()
-        sourceConfig = FrameSourceConfig.GlSurfaceView(surface, renderer)
+        sourceConfig = FrameSourceConfig.GlSurfaceView(surface, renderer, onSessionReady)
     }
 
     /** 方式 3：纯后台，不显示，只录 */
-    fun renderer(renderer: GLSurfaceView.Renderer) {
+    fun offscreen(factory: (RecorderSession) -> GLSurfaceView.Renderer) {
         requireSourceNotSet()
-        sourceConfig = FrameSourceConfig.Offscreen(renderer)
+        sourceConfig = FrameSourceConfig.Offscreen(factory)
     }
 
     /** 方式 4：任意 View 截图录 */
-    fun view(provider: () -> View) {
+    fun view(factory: (RecorderSession) -> View) {
         requireSourceNotSet()
-        sourceConfig = FrameSourceConfig.ViewCapture(provider)
+        sourceConfig = FrameSourceConfig.ViewCapture(factory)
     }
 
     /** 可选：加模糊/水波纹/圆角/自定义滤镜，按声明顺序链式执行 */

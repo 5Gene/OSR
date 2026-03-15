@@ -2,6 +2,7 @@ package osp.osr.fbo.filter
 
 import android.opengl.GLES30
 import osp.osr.fbo.WaterRippleConfig
+import osp.osr.fbo.gl.FboPool
 import osp.osr.fbo.gl.GlUtil
 
 /**
@@ -20,13 +21,15 @@ class WaterRippleFilter(private val config: WaterRippleConfig) : Filter {
     private var width = 0
     private var height = 0
     private var startTimeNs = 0L
+    private var fboPool: FboPool? = null
 
-    override fun init(width: Int, height: Int) {
+    override fun init(width: Int, height: Int, pool: FboPool) {
         this.width = width
         this.height = height
+        fboPool = pool
         startTimeNs = System.nanoTime()
         program = GlUtil.createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
-        val pair = GlUtil.createFboWithTexture(width, height)
+        val pair = pool.acquire(width, height)
         fboId = pair.first
         texId = pair.second
     }
@@ -53,8 +56,12 @@ class WaterRippleFilter(private val config: WaterRippleConfig) : Filter {
 
     override fun release() {
         GLES30.glDeleteProgram(program)
-        GLES30.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
-        GLES30.glDeleteTextures(1, intArrayOf(texId), 0)
+        fboPool?.release(fboId, texId, width, height)
+            ?: run {
+                GLES30.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
+                GLES30.glDeleteTextures(1, intArrayOf(texId), 0)
+            }
+        fboPool = null
     }
 
     companion object {

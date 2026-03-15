@@ -1,6 +1,7 @@
 package osp.osr.fbo
 
 import android.content.Context
+import android.view.View
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -78,16 +79,16 @@ internal class FboRecorderSession(
 
             // 编码器先 prepare，拿到 InputSurface，后面 FrameCaptureRenderer 画的内容就是进这个 Surface
             val surface = encoderController.prepare()
-            OsrLog.d("FboSession: encoder surface ready")
+            OsrLog.i("FboSession: encoder surface ready")
             muxerController.prepare()
-            OsrLog.d("FboSession: muxer ready")
+            OsrLog.i("FboSession: muxer ready")
             audioMixer?.prepare()
 
             val w = config.videoConfig.width
             val h = config.videoConfig.height
             val fps = config.videoConfig.fps
             val sourceConfig = fboConfig.sourceConfig
-                ?: throw RecorderError.ConfigError("未配置帧源（captureRenderer/glSurfaceView/renderer/view）")
+                ?: throw RecorderError.ConfigError("未配置帧源（renderer/glSurfaceView/offscreen/view）")
 
             // 方式 3/4 没有「宿主 GL 线程」需要恢复，skipEglRestore=true 避免无效的 eglMakeCurrent
             val isOffscreen = sourceConfig is FrameSourceConfig.Offscreen
@@ -102,19 +103,32 @@ internal class FboRecorderSession(
             )
             captureRenderer = renderer
 
-            // sealed when：四种模式对应四种 FrameSource，谁在「产帧」、谁在「要帧」一目了然
+            val session: RecorderSession = this
             frameSource = when (sourceConfig) {
                 is FrameSourceConfig.CaptureRenderer ->
-                    CaptureRendererSource(sourceConfig.attach, renderer)
+                    CaptureRendererSource(
+                        attach = { r -> sourceConfig.attach(r, session) },
+                        captureCallback = renderer
+                    )
 
                 is FrameSourceConfig.GlSurfaceView ->
-                    GLSurfaceViewSource(sourceConfig.surface, sourceConfig.renderer, renderer)
+                    GLSurfaceViewSource(sourceConfig.surface, sourceConfig.renderer, renderer).also {
+                        sourceConfig.onSessionReady?.invoke(session)
+                    }
 
-                is FrameSourceConfig.Offscreen ->
-                    OffscreenSource(sourceConfig.renderer, renderer, w, h, fps)
+                is FrameSourceConfig.Offscreen -> {
+                    val userRenderer = sourceConfig.factory(session)
+                    OffscreenSource(userRenderer, renderer, w, h, fps)
+                }
 
-                is FrameSourceConfig.ViewCapture ->
-                    ViewSource(sourceConfig.provider, renderer, w, h, fps)
+                is FrameSourceConfig.ViewCapture -> {
+                    var cachedView: View? = null
+                    ViewSource(
+                        viewProvider = { cachedView ?: sourceConfig.factory(session).also { cachedView = it } },
+                        captureCallback = renderer,
+                        width = w, height = h, fps = fps
+                    )
+                }
             }
 
             OsrLog.i("FboSession: prepare done, source=${sourceConfig::class.simpleName}")
@@ -146,7 +160,7 @@ internal class FboRecorderSession(
                     muxerController.addVideoTrack(format)
                     muxerController.start()
                     audioMixer?.startMixing(scope)
-                    OsrLog.d("FboSession: muxer started, video track added")
+                    OsrLog.i("FboSession: muxer started, video track added")
                 },
                 onFrame = { buffer, info ->
                     ptsNormalizer.normalize(info)
@@ -181,9 +195,9 @@ internal class FboRecorderSession(
                 captureRenderer?.stopCapture()
 
                 encoderController.signalEndOfStream()
-                OsrLog.d("FboSession: waiting encoder done")
+                OsrLog.i("FboSession: waiting encoder done")
                 encoderController.done.await()
-                OsrLog.d("FboSession: encoder done")
+                OsrLog.i("FboSession: encoder done")
 
                 audioMixer?.stopMixing()
                 muxerController.stop()
@@ -216,20 +230,21 @@ internal class FboRecorderSession(
 
     /** 逆序释放：先停「产帧」、再停「编码/混流」、最后 cancel 协程 */
     private fun releaseResources() {
-        OsrLog.d("FboSession: releaseResources")
-        runCatching { frameSource?.release() }
-        runCatching { captureRenderer?.release() }
-        runCatching { encoderController.release() }
-        runCatching { audioMixer?.release() }
-        runCatching { muxerController.release() }
+        OsrLog.i("FboSession: releaseResources start")
+        runCatching { frameSource?.release() }.onFailure { OsrLog.e("FboSession: frameSource.release failed", it) }
+        runCatching { captureRenderer?.release() }.onFailure { OsrLog.e("FboSession: captureRenderer.release failed", it) }
+        runCatching { encoderController.release() }.onFailure { OsrLog.e("FboSession: encoderController.release failed", it) }
+        runCatching { audioMixer?.release() }.onFailure { OsrLog.e("FboSession: audioMixer.release failed", it) }
+        runCatching { muxerController.release() }.onFailure { OsrLog.e("FboSession: muxerController.release failed", it) }
         scope.cancel()
+        OsrLog.i("FboSession: releaseResources done")
     }
 
     private fun checkAndTransition(expected: RecorderState, next: RecorderState) {
         if (!state.compareAndSet(expected, next)) {
-            throw RecorderError.EncoderError(
-                "非法状态转换: 期望 $expected, 实际 ${state.get()}"
-            )
+            val msg = "非法状态转换: 期望 $expected, 实际 ${state.get()}"
+            OsrLog.e("FboSession: $msg")
+            throw RecorderError.EncoderError(msg)
         }
     }
 

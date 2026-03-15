@@ -26,3 +26,14 @@ interface FrameSource {
 interface FrameCaptureCallback {
     fun captureFrame()
 }
+
+/**
+ * 📐 宿主 Surface 尺寸通知（可选）
+ *
+ * 方式 1/2 下，宿主在 onSurfaceChanged 中可通知真实 Surface 宽高，
+ * 供 captureFrame 用作 glBlitFramebuffer 的源矩形，避免依赖 GL_VIEWPORT 在 onDrawFrame 中被局部修改导致的裁剪/偏移。
+ * 实现类：FrameCaptureRenderer。
+ */
+interface SourceSizeSink {
+    fun setSourceSize(width: Int, height: Int)
+}

@@ -1,6 +1,7 @@
 package osp.osr.fbo.gl
 
 import android.opengl.GLES30
+import osp.osr.log.OsrLog
 
 /**
  * 🖼️ 全屏纹理四边形 Program（小白友好）
@@ -25,6 +26,7 @@ class TextureProgram {
 
     init {
         program = GlUtil.createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+        OsrLog.i("TextureProgram: created program=$program")
     }
 
     /**
@@ -37,6 +39,7 @@ class TextureProgram {
 
     fun release() {
         GLES30.glDeleteProgram(program)
+        OsrLog.i("TextureProgram: released")
     }
 
     companion object {

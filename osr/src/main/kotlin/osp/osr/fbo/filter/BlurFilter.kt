@@ -2,6 +2,7 @@ package osp.osr.fbo.filter
 
 import android.opengl.GLES30
 import osp.osr.fbo.BlurConfig
+import osp.osr.fbo.gl.FboPool
 import osp.osr.fbo.gl.GlUtil
 
 /**
@@ -21,14 +22,16 @@ class BlurFilter(private val config: BlurConfig) : Filter {
     private val texIds = IntArray(2)
     private var width = 0
     private var height = 0
+    private var fboPool: FboPool? = null
 
-    override fun init(width: Int, height: Int) {
+    override fun init(width: Int, height: Int, pool: FboPool) {
         this.width = width
         this.height = height
+        fboPool = pool
         programH = GlUtil.createProgram(VERTEX_SHADER, fragmentShader(true))
         programV = GlUtil.createProgram(VERTEX_SHADER, fragmentShader(false))
         repeat(2) { i ->
-            val pair = GlUtil.createFboWithTexture(width, height)
+            val pair = pool.acquire(width, height)
             fboIds[i] = pair.first
             texIds[i] = pair.second
         }
@@ -51,8 +54,13 @@ class BlurFilter(private val config: BlurConfig) : Filter {
     override fun release() {
         GLES30.glDeleteProgram(programH)
         GLES30.glDeleteProgram(programV)
-        GLES30.glDeleteFramebuffers(2, fboIds, 0)
-        GLES30.glDeleteTextures(2, texIds, 0)
+        fboPool?.let { pool ->
+            repeat(2) { i -> pool.release(fboIds[i], texIds[i], width, height) }
+        } ?: run {
+            GLES30.glDeleteFramebuffers(2, fboIds, 0)
+            GLES30.glDeleteTextures(2, texIds, 0)
+        }
+        fboPool = null
     }
 
     /** 水平为 true 时沿 x 方向采样，为 false 时沿 y 方向；权重是高斯近似，中心大两边小 */

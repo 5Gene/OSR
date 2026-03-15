@@ -43,12 +43,17 @@ class EglHelper {
      * **之后谁用**：createPbufferSurface 会用 config；makeCurrent 会用 display/surface/context。
      */
     fun init() {
+        OsrLog.i("EglHelper: init start")
         // 拿到默认显示连接（可以理解成和「图形系统」握上手了）
         display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-        if (display == EGL14.EGL_NO_DISPLAY) throw RuntimeException("eglGetDisplay failed")
+        if (display == EGL14.EGL_NO_DISPLAY) {
+            OsrLog.e("EglHelper: eglGetDisplay failed")
+            throw RuntimeException("eglGetDisplay failed")
+        }
 
         val version = IntArray(2)
         if (!EGL14.eglInitialize(display, version, 0, version, 1)) {
+            OsrLog.e("EglHelper: eglInitialize failed")
             throw RuntimeException("eglInitialize failed")
         }
 
@@ -65,14 +70,21 @@ class EglHelper {
         val configs = arrayOfNulls<EGLConfig>(1)
         val numConfigs = IntArray(1)
         EGL14.eglChooseConfig(display, configAttribs, 0, configs, 0, 1, numConfigs, 0)
-        config = configs[0] ?: throw RuntimeException("eglChooseConfig failed")
+        config = configs[0]
+        if (config == null) {
+            OsrLog.e("EglHelper: eglChooseConfig failed")
+            throw RuntimeException("eglChooseConfig failed")
+        }
 
         // 创建 OpenGL ES 3.0 的上下文（和 config 绑定）
         val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE)
         context = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
-        if (context == EGL14.EGL_NO_CONTEXT) throw RuntimeException("eglCreateContext failed")
+        if (context == EGL14.EGL_NO_CONTEXT) {
+            OsrLog.e("EglHelper: eglCreateContext failed")
+            throw RuntimeException("eglCreateContext failed")
+        }
 
-        OsrLog.d("EglHelper: offscreen EGL context created (GLES 3.0)")
+        OsrLog.i("EglHelper: init done, offscreen EGL context created (GLES 3.0)")
     }
 
     /**
@@ -85,13 +97,17 @@ class EglHelper {
      * 传的是录制分辨率（config.videoConfig 的 width/height）。
      */
     fun createPbufferSurface(width: Int, height: Int) {
+        OsrLog.i("EglHelper: createPbufferSurface ${width}x${height}")
         val attribs = intArrayOf(
             EGL14.EGL_WIDTH, width,
             EGL14.EGL_HEIGHT, height,
             EGL14.EGL_NONE
         )
-        surface = EGL14.eglCreatePbufferSurface(display, config, attribs, 0)
-        if (surface == EGL14.EGL_NO_SURFACE) throw RuntimeException("eglCreatePbufferSurface failed")
+        surface = EGL14.eglCreatePbufferSurface(display, config!!, attribs, 0)
+        if (surface == EGL14.EGL_NO_SURFACE) {
+            OsrLog.e("EglHelper: eglCreatePbufferSurface failed")
+            throw RuntimeException("eglCreatePbufferSurface failed")
+        }
     }
 
     /**
@@ -109,6 +125,7 @@ class EglHelper {
      * 谁调我：OffscreenSource.release()、ViewSource.release()
      */
     fun release() {
+        OsrLog.i("EglHelper: release start")
         if (display != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             if (surface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, surface)
@@ -118,6 +135,6 @@ class EglHelper {
         display = EGL14.EGL_NO_DISPLAY
         context = EGL14.EGL_NO_CONTEXT
         surface = EGL14.EGL_NO_SURFACE
-        OsrLog.d("EglHelper: released")
+        OsrLog.i("EglHelper: released")
     }
 }

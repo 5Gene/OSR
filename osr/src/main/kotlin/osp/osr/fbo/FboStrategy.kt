@@ -3,6 +3,7 @@ package osp.osr.fbo
 import android.content.Context
 import osp.osr.RecorderSession
 import osp.osr.dsl.RecorderConfig
+import osp.osr.log.OsrLog
 import osp.osr.render.RenderStrategy
 
 /**
@@ -21,8 +22,10 @@ fun RecorderConfig.fbo(block: FboConfig.() -> Unit) {
 
 class FboStrategy(private val fboConfig: FboConfig) : RenderStrategy {
     override suspend fun createSession(context: Context, config: RecorderConfig): RecorderSession {
+        OsrLog.i("FboStrategy: createSession start")
         val session = FboRecorderSession(context, config, fboConfig)
         session.prepare()
+        OsrLog.i("FboStrategy: createSession done")
         return session
     }
 }

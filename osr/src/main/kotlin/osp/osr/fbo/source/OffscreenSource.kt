@@ -72,9 +72,11 @@ class OffscreenSource(
     }
 
     override fun release() {
+        OsrLog.i("OffscreenSource: release start")
         recording = false
         loopJob?.cancel()
-        runCatching { eglHelper.release() }
+        runCatching { eglHelper.release() }.onFailure { OsrLog.e("OffscreenSource: eglHelper.release failed", it) }
         scope.cancel()
+        OsrLog.i("OffscreenSource: released")
     }
 }

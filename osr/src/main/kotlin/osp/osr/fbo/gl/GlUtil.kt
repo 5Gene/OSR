@@ -67,6 +67,7 @@ object GlUtil {
         if (status[0] == 0) {
             val log = GLES30.glGetProgramInfoLog(program)
             GLES30.glDeleteProgram(program)
+            OsrLog.e("GlUtil: Program link failed: $log")
             throw RuntimeException("Program link failed: $log")
         }
         GLES30.glDeleteShader(vs)
@@ -187,6 +188,7 @@ object GlUtil {
         if (status[0] == 0) {
             val log = GLES30.glGetShaderInfoLog(shader)
             GLES30.glDeleteShader(shader)
+            OsrLog.e("GlUtil: Shader compile failed: $log")
             throw RuntimeException("Shader compile failed: $log")
         }
         return shader
