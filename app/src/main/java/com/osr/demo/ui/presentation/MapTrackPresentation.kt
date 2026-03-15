@@ -4,7 +4,10 @@ import android.app.Presentation
 import android.os.Bundle
 import android.view.Display
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import com.osr.demo.ui.components.MapTrackView
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import osp.osr.RecorderSession
 
 /**
@@ -23,9 +26,13 @@ class MapTrackPresentation(
         setContentView(mapTrackView)
 
         mapTrackView.setOnMapLoadedListener {
-            // 地图加载完成后启动轨迹动画（约 100 点 × 50ms ≈ 5 秒）
-            mapTrackView.startTrackAnimation()
-            session.startRecord()
+            activity.lifecycleScope.launch {
+                delay(1000)
+                session.startRecord()
+                delay(2000)
+                // 地图加载完成后启动轨迹动画（约 100 点 × 50ms ≈ 5 秒）
+                mapTrackView.startTrackAnimation()
+            }
         }
 
         mapTrackView.setOnAnimationEndListener {

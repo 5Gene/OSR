@@ -13,9 +13,20 @@ class VideoConfig {
     var iFrameInterval: Int = 1
 }
 
-/** 🎵 可选背景音：设置后保存时混入，音频短于视频则循环 */
+/**
+ * 🎵 可选背景音：设置后保存时混入 MP4，音频短于视频则循环。
+ *
+ * **MP4 常见可混合的音频格式**（参考 ISO 基媒体格式）：
+ * - AAC（.aac / .m4a）：推荐，兼容性最好，本库**仅支持此格式**
+ * - MP3：部分 Muxer 支持，本库不支持
+ * - AC-3 / E-AC3：部分支持
+ * - 其他（Opus、Vorbis 等）：视容器与设备而定
+ *
+ * **限制**：当前仅支持 **AAC**（MIME 为 `audio/mp4a-latm` 或 `audio/aac`），
+ * 非 AAC 文件在 prepare 时会抛出 [osp.osr.model.RecorderError.AudioError]。
+ */
 class AudioConfig {
-    // 必须是acc格式音频文件
+    /** AAC 音频文件（.aac / .m4a），null 表示不混入背景音 */
     var file: File? = null
 }
 
@@ -43,7 +54,6 @@ class RecorderConfig {
     val audioConfig = AudioConfig()
     val outputConfig = OutputConfig()
     val listenerConfig = ListenerConfig()
-
     /** 渲染策略，由 presentation { } / fbo { } 等扩展函数注入 */
     var renderStrategy: RenderStrategy? = null
 

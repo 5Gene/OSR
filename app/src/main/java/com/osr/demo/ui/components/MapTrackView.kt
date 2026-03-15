@@ -68,7 +68,7 @@ class MapTrackView @JvmOverloads constructor(
                 }
 
                 override fun onDrawFrame(p0: GL10?) {
-                    println("CustomRenderer => onDrawFrame")
+//                    println("CustomRenderer => onDrawFrame")
                 }
 
                 override fun onSurfaceChanged(p0: GL10?, p1: Int, p2: Int) {

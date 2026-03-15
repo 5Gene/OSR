@@ -23,7 +23,17 @@ internal class VirtualDisplayManager(private val context: Context) {
         get() = virtualDisplay?.display
             ?: throw RecorderError.DisplayError("VirtualDisplay 尚未创建")
 
-    /** 绑定 [surface]（来自 EncoderController），按 [videoConfig] 尺寸创建虚拟 Display */
+    /**
+     * 绑定 [surface]（来自 EncoderController.createInputSurface），按 [videoConfig] 尺寸创建虚拟 Display。
+     *
+     * DisplayManager.createVirtualDisplay(name, width, height, densityDpi, surface, flags)：
+     * 创建一个虚拟 Display，其内容将渲染到给定的 Surface 上。
+     * 执行后：virtualDisplay.display 可交给 Presentation；在 Presentation 上绘制的内容会合成到 surface，
+     *        即编码器的 InputSurface，故绘制会直接作为编码器输入（编码器 start 后开始取帧）。
+     * VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY：仅合成本 Display 自己的内容，不包含其他层。
+     *
+     * 下一步：调用方用返回的 Display 做 presentationController.show(display, session)。
+     */
     fun createDisplay(surface: Surface, videoConfig: VideoConfig): Display {
         OsrLog.d("create VirtualDisplay ${videoConfig.width}x${videoConfig.height} densityDpi=${context.resources.displayMetrics.densityDpi}")
         val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -41,6 +51,10 @@ internal class VirtualDisplayManager(private val context: Context) {
         return virtualDisplay!!.display
     }
 
+    /**
+     * 释放 VirtualDisplay。
+     * release()：销毁虚拟 Display，不再向 Surface 合成；执行后 display 不可再使用。
+     */
     fun release() {
         OsrLog.d("release VirtualDisplay")
         try {
