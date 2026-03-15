@@ -3,7 +3,7 @@ plugins {
 }
 
 android {
-    namespace = "com.osp.osr"
+    namespace = "com.osp.osc"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1

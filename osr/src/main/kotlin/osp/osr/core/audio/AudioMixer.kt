@@ -91,7 +91,6 @@ class AudioMixer(
         OsrLog.d("startMixing")
 
         val frameDurationUs = 1024L * 1_000_000L / sampleRate
-        val frameDurationMs = frameDurationUs / 1000
 
         mixingJob = scope.launch(Dispatchers.IO) {
             val buffer = ByteBuffer.allocateDirect(MAX_BUFFER_SIZE)
@@ -109,7 +108,8 @@ class AudioMixer(
                 val sampleSize = ext.readSampleData(buffer, 0)
                 if (sampleSize < 0) {
                     if (!seekToBeginning(ext)) break
-                    loopOffsetUs = lastWrittenPtsUs + LOOP_GAP_US
+                    // 用一帧时长做 PTS 递进，不插静音，避免循环时“顿一下”
+                    loopOffsetUs = lastWrittenPtsUs + frameDurationUs
                     continue
                 }
 
@@ -136,7 +136,8 @@ class AudioMixer(
                 // 移到下一包；false = 已经到轨末尾，下一轮 readSampleData 会 <0，上面会 seek 或 break。
                 if (!ext.advance()) {
                     if (!seekToBeginning(ext)) break
-                    loopOffsetUs = lastWrittenPtsUs + LOOP_GAP_US
+                    // 用一帧时长做 PTS 递进，不插静音，避免循环时“顿一下”
+                    loopOffsetUs = lastWrittenPtsUs + frameDurationUs
                 }
 
                 // ⏱️ 节奏：按「当前 pts 对应的真实时间」sleep，避免一口气写完全部音频。
@@ -205,8 +206,5 @@ class AudioMixer(
 
     companion object {
         private const val MAX_BUFFER_SIZE = 256 * 1024
-
-        /** 循环时 seek 回 0 后，下一段音频的 pts 要在上一段末尾基础上加这个间隔，否则 Muxer 可能报 out of order */
-        private const val LOOP_GAP_US = 1000L
     }
 }

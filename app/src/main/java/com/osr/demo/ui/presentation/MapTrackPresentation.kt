@@ -26,11 +26,11 @@ class MapTrackPresentation(
         setContentView(mapTrackView)
 
         mapTrackView.setOnMapLoadedListener {
+            // 地图加载完成后启动轨迹动画（约 100 点 × 50ms ≈ 5 秒）
             activity.lifecycleScope.launch {
-                delay(1000)
+                mapTrackView.postInvalidate()
                 session.startRecord()
-                delay(2000)
-                // 地图加载完成后启动轨迹动画（约 100 点 × 50ms ≈ 5 秒）
+                delay(1000)
                 mapTrackView.startTrackAnimation()
             }
         }

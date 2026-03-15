@@ -29,4 +29,8 @@ sealed class RecorderError(
     /** 音频文件或混音过程出错 */
     class AudioError(message: String, cause: Throwable? = null) :
         RecorderError(message, cause)
+
+    /** DSL 配置校验失败 */
+    class ConfigError(message: String, cause: Throwable? = null) :
+        RecorderError(message, cause)
 }

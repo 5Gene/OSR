@@ -11,8 +11,9 @@ import osp.osr.RecorderSession
 import osp.osr.core.audio.AudioMixer
 import osp.osr.core.encoder.EncoderController
 import osp.osr.core.muxer.MuxerController
+import osp.osr.core.util.PtsNormalizer
+import osp.osr.core.util.SessionNotifier
 import osp.osr.dsl.RecorderConfig
-import osp.osr.listener.ListenerConfig
 import osp.osr.log.OsrLog
 import osp.osr.model.RecorderError
 import osp.osr.model.RecorderState
@@ -46,21 +47,12 @@ internal class PresentationRecorderSession(
         AudioMixer(it, muxerController)
     }
 
-    private val listener: ListenerConfig get() = config.listenerConfig
-
-    /** 📌 编码器第一帧的绝对 pts（系统单调时钟），onFrame 里用来做「归零基准」 */
-    private var firstPresentationTimeUs = -1L
-
-    /** 📌 归零后的最后一帧 pts = 视频相对时长（微秒），stopRecord 时可用于音频对齐 */
-    private var lastPresentationTimeUs = 0L
+    private val ptsNormalizer = PtsNormalizer()
+    private val notifier = SessionNotifier(config.listenerConfig)
 
     /**
-     * 🛠️ prepare：搭好整条管线，但**不**开始编码。
-     *
-     * **为什么这样设计**：Presentation 要先 show 并渲染几帧到 Surface 上，编码器再 start，
-     * 否则 encoder 一启动就会抓到「空 Surface」→ 录出来开头黑屏。
-     *
-     * **执行后**：调用方拿到 session，下一步通常是 `startRecord()`。
+     * 🛠️ prepare：搭好管线（encoder/muxer/display/show），**不**启动编码器。
+     * 等画面就绪（如地图加载完）后调 startRecord()，再 encoder.start()，首帧就是那时的画面。
      */
     suspend fun prepare() {
         val outputPath = config.outputConfig.file?.absolutePath ?: ""
@@ -69,7 +61,6 @@ internal class PresentationRecorderSession(
         checkAndTransition(RecorderState.IDLE, RecorderState.PREPARED)
 
         try {
-            // 👉 返回的 surface 会交给 VirtualDisplay，画上去的内容之后会被编码器吃掉
             val surface = encoderController.prepare()
             OsrLog.d("encoder surface ready")
             muxerController.prepare()
@@ -77,81 +68,52 @@ internal class PresentationRecorderSession(
             audioMixer?.prepare()
             OsrLog.d("audioMixer prepared (optional)")
 
-            // 👉 VirtualDisplay 绑定了 encoder 的 surface，Presentation 画到 display 上 = 画到 surface 上
             val display = displayManager.createDisplay(surface, config.videoConfig)
             OsrLog.d("VirtualDisplay ready")
             presentationController.show(display, this)
-            // ⏱️ 为啥要 delay：show() 返回后，Android 还要至少 2 个 Vsync 才完成首帧布局+绘制。
-            // 不等的后果：startRecord 里 encoder.start() 一开，第一帧就是黑屏，后续 onFrame 会一直收到黑帧。
             delay(PRESENTATION_SETTLE_MS)
-            OsrLog.i("prepare done PREPARED, Presentation shown and settled")
+            OsrLog.i("prepare done PREPARED")
         } catch (e: Exception) {
             OsrLog.e("prepare failed output=$outputPath", e)
             state.set(RecorderState.RELEASED)
             releaseResources()
-            notifyError(wrapError(e))
+            notifier.notifyError(wrapError(e))
             throw e
         }
     }
 
     /**
-     * ▶️ startRecord：真正开始录。编码器开跑 → 很快触发 onFormatChanged → 再一帧一帧触发 onFrame。
-     *
-     * **为什么先 start 再 launchEncoderLoop**：encoder.start() 后才会从 Surface 取帧并产出格式；
-     * Loop 里第一次 dequeue 就会拿到 INFO_OUTPUT_FORMAT_CHANGED，然后我们的 onFormatChanged 被调，
-     * 里面 addVideoTrack + muxer.start()，之后 onFrame 才能安全写视频 sample。
+     * ▶️ startRecord：此时再 encoder.start() + 启动编码循环，首帧就是「开始录制」时的画面。
      */
     override fun startRecord() {
         OsrLog.i("startRecord PREPARED -> RECORDING")
         checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
 
         try {
-            // 🚀 编码器一 start，就会开始「盯」着 InputSurface，Surface 上每更新一帧就编一帧。
-            // 效果：EncoderController 内部的 dequeue 循环很快就会收到 OUTPUT_FORMAT_CHANGED，然后是一串视频帧。
             encoderController.start()
-            OsrLog.d("encoder started")
-
-            var videoFrameCount = 0
-
             encoderController.launchEncoderLoop(
                 scope = recorderScope,
-                // 📢 只会在「编码器第一次产出格式」时被调一次。
-                // 为啥这里要 start Muxer：MediaMuxer 规定必须先 addTrack 再 start，start 之后才能 writeSampleData。
-                // 效果：Muxer 进入可写状态；同时这里启动音频协程，和视频并行往 Muxer 里塞数据。
                 onFormatChanged = { format ->
                     muxerController.addVideoTrack(format)
                     muxerController.start()
-                    OsrLog.d("muxer started, video track added")
                     audioMixer?.startMixing(recorderScope)
+                    OsrLog.d("muxer started, video track added")
                 },
-                // 📢 每一帧编码完都会调这个；在 EncoderController 里是「先 onFrame，再 releaseOutputBuffer」。
-                // 所以 buffer 在这里是有效的，不用深拷贝，直接写给 Muxer 即可。
                 onFrame = { buffer, info ->
-                    val rawPts = info.presentationTimeUs
-                    if (firstPresentationTimeUs < 0) firstPresentationTimeUs = rawPts
-                    // 🕐 归零：编码器给的 pts 是系统单调时钟（可能几十秒起步），不归零的话播放器会在前面插一大段黑屏。
-                    val normalizedPts = rawPts - firstPresentationTimeUs
-                    info.presentationTimeUs = normalizedPts
-
+                    ptsNormalizer.normalize(info)
                     muxerController.writeSampleData(
                         muxerController.getVideoTrackIndex(),
                         buffer,
                         info
                     )
-                    lastPresentationTimeUs = normalizedPts
-                    videoFrameCount++
-                    if (videoFrameCount == 1) OsrLog.d("muxer video first frame rawPts=${rawPts}us normalizedPts=${normalizedPts}us")
-                    else if (videoFrameCount % 30 == 0) OsrLog.d("muxer video frames=$videoFrameCount pts=${normalizedPts}us")
                 }
             )
-
-            notifyStart()
-            OsrLog.d("onStart notified")
+            notifier.notifyStart()
         } catch (e: Exception) {
             OsrLog.e("startRecord failed", e)
             state.set(RecorderState.RELEASED)
             releaseResources()
-            notifyError(wrapError(e))
+            notifier.notifyError(wrapError(e))
             throw e
         }
     }
@@ -163,7 +125,7 @@ internal class PresentationRecorderSession(
      * 若编码器还在往 Muxer 写帧，会乱套或丢帧。所以先 signalEndOfStream，等 EncoderLoop 里收到 EOS 并 break，done 才 complete。
      */
     override fun stopRecord() {
-        OsrLog.i("stopRecord RECORDING -> STOPPING lastPts=${lastPresentationTimeUs}us")
+        OsrLog.i("stopRecord RECORDING -> STOPPING lastPts=${ptsNormalizer.lastPts}us")
         checkAndTransition(RecorderState.RECORDING, RecorderState.STOPPING)
 
         recorderScope.launch {
@@ -183,16 +145,15 @@ internal class PresentationRecorderSession(
                 muxerController.stop()
                 OsrLog.i("muxer stopped")
 
-                notifyStop()
-                val savedFile = config.outputConfig.file
-                if (savedFile != null) {
-                    OsrLog.i("notifySaved path=${savedFile.absolutePath}")
-                    notifySaved(savedFile)
+                notifier.notifyStop()
+                config.outputConfig.file?.let {
+                    OsrLog.i("notifySaved path=${it.absolutePath}")
+                    notifier.notifySaved(it)
                 }
                 OsrLog.d("onStop/onSaved notified")
             } catch (e: Exception) {
                 OsrLog.e("stopRecord failed", e)
-                notifyError(wrapError(e))
+                notifier.notifyError(wrapError(e))
             } finally {
                 state.set(RecorderState.RELEASED)
                 releaseResources()
@@ -242,36 +203,8 @@ internal class PresentationRecorderSession(
         else RecorderError.EncoderError("录制异常", e)
     }
 
-    private fun notifyStart() {
-        try {
-            listener.onStart?.invoke()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun notifyStop() {
-        try {
-            listener.onStop?.invoke()
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun notifySaved(file: java.io.File) {
-        try {
-            listener.onSaved?.invoke(file)
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun notifyError(error: RecorderError) {
-        try {
-            listener.onError?.invoke(error)
-        } catch (_: Exception) {
-        }
-    }
-
     companion object {
-        /** ⏱️ Presentation show 后等多长时间再认为「首帧画好了」；约 2～3 个 Vsync，减少开头黑帧概率 */
+        /** ⏱️ Presentation show 后等多长时间再认为首帧稳定；约 2～3 个 Vsync */
         private const val PRESENTATION_SETTLE_MS = 100L
     }
 }

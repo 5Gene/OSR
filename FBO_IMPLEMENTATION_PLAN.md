@@ -1,17 +1,35 @@
-本文档为 **FBO 渲染策略** 的完整设计方案，与实现方案保持一致。库同时支持 Presentation 策略（见 IMPLEMENTATION_SUMMARY），两者均实现
-RenderStrategy，由扩展函数注入。本文档用于指导实现与后续迭代。
-
+---
+name: FBO MapView DSL 重构
+overview: 重新设计 FBO 策略的 Source 体系和 DSL 接口：库不再持有 MapView 引用，改为基于 GLSurfaceView.Renderer 的帧捕获机制；提供 4 种简洁的输入模式（captureRenderer / glSurfaceView / renderer / view），配合内置 + 自定义滤镜系统，支持地图、GL 控件、自定义渲染器和普通 View 的录制。
+todos:
+  - id: update-fbo-md
+    content: 更新 FBO.md 方案文档：删除 MapSource/MapView 相关内容，新增 4 种模式 + Filter DSL + 架构图 + 模块结构
+    status: pending
+  - id: impl-fbo-config
+    content: 实现 FboConfig DSL（含 FrameSourceConfig sealed interface + FilterConfig）和 FboStrategy
+    status: pending
+  - id: impl-core-util
+    content: 实现 PtsNormalizer + SessionNotifier 公共工具类，重构 PresentationRecorderSession 使用
+    status: pending
+  - id: impl-frame-sources
+    content: 实现 FrameSource + FrameCaptureCallback 接口和 4 种 FrameSource 实现
+    status: pending
+  - id: impl-capture-core
+    content: 实现 FrameCaptureRenderer（impl FrameCaptureCallback + FBO + glBlitFramebuffer + EGL）和 EglSurfaceManager
+    status: pending
+  - id: impl-filter
+    content: 实现 Filter 接口（@WorkerThread）+ FilterPipeline（合并一文件）+ 内置滤镜 + custom 扩展
+    status: pending
+  - id: impl-fbo-session
+    content: 实现 FboRecorderSession（状态机、编排 source+capture+filter+encoder+muxer）
+    status: pending
+  - id: impl-gl-utils
+    content: 实现 EglHelper 和 TextureProgram GL 工具类
+    status: pending
+isProject: false
 ---
 
 # FBO 策略重构方案：解耦 MapView + 简化 DSL
-
----
-
-## 零、基础知识（小白先看这篇）
-
-**GLSurfaceView、Renderer、FBO、MediaCodec、Surface** 分别是什么？画面是怎么通过 FBO 保存成文件的？滤镜是在哪一环加上的？
-
-👉 **已单独写成 [FBO_基础.md](FBO_基础.md)**，里面有概念解释、比喻、多张流程图和 emoji，建议先读那篇再回来看本方案。
 
 ---
 
@@ -37,7 +55,7 @@ MapView 内部使用 GLSurfaceView 进行 OpenGL 渲染。AMap 提供 `setCustom
 ```kotlin
 // AMap SDK 中的 CustomRenderer
 interface CustomRenderer : GLSurfaceView.Renderer {
-  fun OnMapReferencechanged()
+    fun OnMapReferencechanged()
 }
 ```
 
@@ -100,20 +118,20 @@ display/context 减少查询。超过 8ms 的帧捕获会打 warning 日志。
 ```kotlin
 /** 帧源配置 — sealed 保证穷举，data class 只持有配置参数 */
 sealed interface FrameSourceConfig {
-  /** 模式A：库提供 Renderer，用户挂载到 GL 宿主（地图等） */
-  data class CaptureRenderer(val attach: (GLSurfaceView.Renderer) -> Unit) : FrameSourceConfig
+    /** 模式A：库提供 Renderer，用户挂载到 GL 宿主（地图等） */
+    data class CaptureRenderer(val attach: (GLSurfaceView.Renderer) -> Unit) : FrameSourceConfig
 
-  /** 模式B：传入 GLSurfaceView + 用户 Renderer，边显示边录制 */
-  data class GLSurfaceView(
-    val surface: android.opengl.GLSurfaceView,
-    val renderer: GLSurfaceView.Renderer
-  ) : FrameSourceConfig
+    /** 模式B：传入 GLSurfaceView + 用户 Renderer，边显示边录制 */
+    data class GLSurfaceView(
+        val surface: android.opengl.GLSurfaceView,
+        val renderer: GLSurfaceView.Renderer
+    ) : FrameSourceConfig
 
-  /** 模式C：自定义 Renderer，纯离屏录制 */
-  data class Offscreen(val renderer: GLSurfaceView.Renderer) : FrameSourceConfig
+    /** 模式C：自定义 Renderer，纯离屏录制 */
+    data class Offscreen(val renderer: GLSurfaceView.Renderer) : FrameSourceConfig
 
-  /** 模式D：View 录制，Canvas -> Bitmap -> Texture */
-  data class ViewCapture(val provider: () -> View) : FrameSourceConfig
+    /** 模式D：View 录制，Canvas -> Bitmap -> Texture */
+    data class ViewCapture(val provider: () -> View) : FrameSourceConfig
 }
 ```
 
@@ -122,40 +140,40 @@ sealed interface FrameSourceConfig {
 ```kotlin
 @RecorderDsl
 class FboConfig {
-  internal var sourceConfig: FrameSourceConfig? = null
-  internal var filterConfig: FilterConfig? = null
+    internal var sourceConfig: FrameSourceConfig? = null
+    internal var filterConfig: FilterConfig? = null
 
-  private fun requireSourceNotSet() {
-    require(sourceConfig == null) { "只能选择一种录制模式（captureRenderer / glSurfaceView / renderer / view）" }
-  }
+    private fun requireSourceNotSet() {
+        require(sourceConfig == null) { "只能选择一种录制模式（captureRenderer / glSurfaceView / renderer / view）" }
+    }
 
-  fun captureRenderer(attach: (GLSurfaceView.Renderer) -> Unit) {
-    requireSourceNotSet()
-    sourceConfig = FrameSourceConfig.CaptureRenderer(attach)
-  }
+    fun captureRenderer(attach: (GLSurfaceView.Renderer) -> Unit) {
+        requireSourceNotSet()
+        sourceConfig = FrameSourceConfig.CaptureRenderer(attach)
+    }
 
-  /**
-   * 约束：必须在 GLSurfaceView.setRenderer() 之前调用，
-   * 库内部会用装饰器包装 renderer 并调 setRenderer()。
-   */
-  fun glSurfaceView(surface: android.opengl.GLSurfaceView, renderer: GLSurfaceView.Renderer) {
-    requireSourceNotSet()
-    sourceConfig = FrameSourceConfig.GLSurfaceView(surface, renderer)
-  }
+    /**
+     * 约束：必须在 GLSurfaceView.setRenderer() 之前调用，
+     * 库内部会用装饰器包装 renderer 并调 setRenderer()。
+     */
+    fun glSurfaceView(surface: android.opengl.GLSurfaceView, renderer: GLSurfaceView.Renderer) {
+        requireSourceNotSet()
+        sourceConfig = FrameSourceConfig.GLSurfaceView(surface, renderer)
+    }
 
-  fun renderer(renderer: GLSurfaceView.Renderer) {
-    requireSourceNotSet()
-    sourceConfig = FrameSourceConfig.Offscreen(renderer)
-  }
+    fun renderer(renderer: GLSurfaceView.Renderer) {
+        requireSourceNotSet()
+        sourceConfig = FrameSourceConfig.Offscreen(renderer)
+    }
 
-  fun view(provider: () -> View) {
-    requireSourceNotSet()
-    sourceConfig = FrameSourceConfig.ViewCapture(provider)
-  }
+    fun view(provider: () -> View) {
+        requireSourceNotSet()
+        sourceConfig = FrameSourceConfig.ViewCapture(provider)
+    }
 
-  fun filters(block: FilterConfig.() -> Unit) {
-    filterConfig = FilterConfig().apply(block)
-  }
+    fun filters(block: FilterConfig.() -> Unit) {
+        filterConfig = FilterConfig().apply(block)
+    }
 }
 ```
 
@@ -171,51 +189,51 @@ class FboConfig {
 ```kotlin
 @RecorderDsl
 class FilterConfig {
-  internal val filters = mutableListOf<Filter>()
+    internal val filters = mutableListOf<Filter>()
 
-  /** 内置：高斯模糊 */
-  fun blur(block: BlurConfig.() -> Unit = {}) {
-    filters.add(BlurFilter(BlurConfig().apply(block)))
-  }
+    /** 内置：高斯模糊 */
+    fun blur(block: BlurConfig.() -> Unit = {}) {
+        filters.add(BlurFilter(BlurConfig().apply(block)))
+    }
 
-  /** 内置：水波纹效果 */
-  fun waterRipple(block: WaterRippleConfig.() -> Unit = {}) {
-    filters.add(WaterRippleFilter(WaterRippleConfig().apply(block)))
-  }
+    /** 内置：水波纹效果 */
+    fun waterRipple(block: WaterRippleConfig.() -> Unit = {}) {
+        filters.add(WaterRippleFilter(WaterRippleConfig().apply(block)))
+    }
 
-  /** 内置：圆角裁剪 */
-  fun roundCorner(block: RoundCornerConfig.() -> Unit = {}) {
-    filters.add(RoundCornerFilter(RoundCornerConfig().apply(block)))
-  }
+    /** 内置：圆角裁剪 */
+    fun roundCorner(block: RoundCornerConfig.() -> Unit = {}) {
+        filters.add(RoundCornerFilter(RoundCornerConfig().apply(block)))
+    }
 
-  /** 用户自定义滤镜（实现 Filter 接口） */
-  fun custom(vararg filter: Filter) {
-    filters.addAll(filter)
-  }
+    /** 用户自定义滤镜（实现 Filter 接口） */
+    fun custom(vararg filter: Filter) {
+        filters.addAll(filter)
+    }
 }
 
 /** 模糊参数 */
 class BlurConfig {
-  /** 模糊半径，值越大越模糊 (1~25) */
-  var radius: Float = 5f
+    /** 模糊半径，值越大越模糊 (1~25) */
+    var radius: Float = 5f
 }
 
 /** 水波纹参数 */
 class WaterRippleConfig {
-  /** 波浪振幅 */
-  var amplitude: Float = 0.02f
+    /** 波浪振幅 */
+    var amplitude: Float = 0.02f
 
-  /** 波浪频率 */
-  var frequency: Float = 20f
+    /** 波浪频率 */
+    var frequency: Float = 20f
 
-  /** 波浪速度 */
-  var speed: Float = 1.0f
+    /** 波浪速度 */
+    var speed: Float = 1.0f
 }
 
 /** 圆角参数 */
 class RoundCornerConfig {
-  /** 圆角半径 (px) */
-  var radius: Float = 16f
+    /** 圆角半径 (px) */
+    var radius: Float = 16f
 }
 ```
 
@@ -230,19 +248,19 @@ class RoundCornerConfig {
  * GL 资源的创建放在 init()，释放放在 release()。
  */
 interface Filter {
-  /** GL 初始化（编译 shader、创建内部 FBO 等） */
-  @WorkerThread
-  fun init(width: Int, height: Int)
+    /** GL 初始化（编译 shader、创建内部 FBO 等） */
+    @WorkerThread
+    fun init(width: Int, height: Int)
 
-  /**
-   * 对输入纹理应用滤镜效果，返回输出纹理 ID。
-   * 实现方自行管理内部 FBO 和输出纹理，调用方只关心输入/输出纹理 ID。
-   */
-  @WorkerThread
-  fun apply(inputTexture: Int): Int
+    /**
+     * 对输入纹理应用滤镜效果，返回输出纹理 ID。
+     * 实现方自行管理内部 FBO 和输出纹理，调用方只关心输入/输出纹理 ID。
+     */
+    @WorkerThread
+    fun apply(inputTexture: Int): Int
 
-  /** 释放 GL 资源（内部 FBO、shader、纹理等） */
-  @WorkerThread
+    /** 释放 GL 资源（内部 FBO、shader、纹理等） */
+    @WorkerThread
     fun release()
 }
 ```
@@ -258,16 +276,16 @@ interface Filter {
 ```kotlin
 // osp.osr.fbo 包，与 presentation {} 对等
 fun RecorderConfig.fbo(block: FboConfig.() -> Unit) {
-  val fboConfig = FboConfig().apply(block)
-  renderStrategy = FboStrategy(fboConfig)
+    val fboConfig = FboConfig().apply(block)
+    renderStrategy = FboStrategy(fboConfig)
 }
 
 class FboStrategy(private val fboConfig: FboConfig) : RenderStrategy {
-  override suspend fun createSession(context: Context, config: RecorderConfig): RecorderSession {
-    val session = FboRecorderSession(context, config, fboConfig)
-    session.prepare()
-    return session
-  }
+    override suspend fun createSession(context: Context, config: RecorderConfig): RecorderSession {
+        val session = FboRecorderSession(context, config, fboConfig)
+        session.prepare()
+        return session
+    }
 }
 ```
 
@@ -282,35 +300,35 @@ class FboStrategy(private val fboConfig: FboConfig) : RenderStrategy {
 ```kotlin
 lifecycleScope.launch {
     val session = OSR.recorder(context) {
-      video { width = 1080; height = 1920; fps = 30 }
-      output { file = File(getExternalFilesDir(null), "map.mp4") }
-      audio { file = rawFile(R.raw.bgm) }
-      listener { onSaved = { file -> toast("saved: $file") } }
+        video { width = 1080; height = 1920; fps = 30 }
+        output { file = File(getExternalFilesDir(null), "map.mp4") }
+        audio { file = rawFile(R.raw.bgm) }
+        listener { onSaved = { file -> toast("saved: $file") } }
 
         fbo {
-          captureRenderer { frameCapture ->
-            mapView.map.setCustomRenderer(frameCapture.asCustomRenderer())
-          }
-          filters {
-            blur { radius = 3f }
-            roundCorner { radius = 16f }
-          }
+            captureRenderer { frameCapture ->
+                mapView.map.setCustomRenderer(frameCapture.asCustomRenderer())
+            }
+            filters {
+                blur { radius = 3f }
+                roundCorner { radius = 16f }
+            }
         }
     }
 
-  session.startRecord()
-  playRouteAnimation()
-  session.stopRecord()
+    session.startRecord()
+    playRouteAnimation()
+    session.stopRecord()
 }
 
 // 用户 App 中的适配扩展（不在库内，无 AMap SDK 依赖）
 fun GLSurfaceView.Renderer.asCustomRenderer() = object : CustomRenderer {
-  override fun onDrawFrame(gl: GL10?) = this@asCustomRenderer.onDrawFrame(gl)
-  override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) =
-    this@asCustomRenderer.onSurfaceCreated(gl, config)
-  override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) =
-    this@asCustomRenderer.onSurfaceChanged(gl, w, h)
-  override fun OnMapReferencechanged() {}
+    override fun onDrawFrame(gl: GL10?) = this@asCustomRenderer.onDrawFrame(gl)
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) =
+        this@asCustomRenderer.onSurfaceCreated(gl, config)
+    override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) =
+        this@asCustomRenderer.onSurfaceChanged(gl, w, h)
+    override fun OnMapReferencechanged() {}
 }
 ```
 
@@ -355,22 +373,22 @@ val myGLSurfaceView = GLSurfaceView(context)
 val myGameRenderer = MyGameRenderer()
 
 lifecycleScope.launch {
-  val session = OSR.recorder(context) {
-    video { width = 720; height = 1280; fps = 60 }
-    output { file = File(getExternalFilesDir(null), "game.mp4") }
+    val session = OSR.recorder(context) {
+        video { width = 720; height = 1280; fps = 60 }
+        output { file = File(getExternalFilesDir(null), "game.mp4") }
 
-    fbo {
-      glSurfaceView(myGLSurfaceView, myGameRenderer)
-      filters {
-        waterRipple { amplitude = 0.03f }
-        custom(MyVignetteFilter(), MyColorGradingFilter())
-      }
+        fbo {
+            glSurfaceView(myGLSurfaceView, myGameRenderer)
+            filters {
+                waterRipple { amplitude = 0.03f }
+                custom(MyVignetteFilter(), MyColorGradingFilter())
+            }
+        }
     }
-  }
 
-  session.startRecord()
-  delay(10_000)
-  session.stopRecord()
+    session.startRecord()
+    delay(10_000)
+    session.stopRecord()
 }
 ```
 
@@ -418,24 +436,24 @@ sequenceDiagram
 
 ```kotlin
 lifecycleScope.launch {
-  val session = OSR.recorder(context) {
-    video { width = 1080; height = 1080; fps = 30 }
-    output { file = File(getExternalFilesDir(null), "3d.mp4") }
+    val session = OSR.recorder(context) {
+        video { width = 1080; height = 1080; fps = 30 }
+        output { file = File(getExternalFilesDir(null), "3d.mp4") }
 
-    fbo {
-      renderer(My3DSceneRenderer())
-      filters {
-        blur { radius = 2f }
-        waterRipple()
-        roundCorner { radius = 24f }
-        custom(MyCustomFilter())
-      }
-    }
+        fbo {
+            renderer(My3DSceneRenderer())
+            filters {
+                blur { radius = 2f }
+                waterRipple()
+                roundCorner { radius = 24f }
+                custom(MyCustomFilter())
+            }
+        }
     }
 
-  session.startRecord()
-  delay(5_000)
-  session.stopRecord()
+    session.startRecord()
+    delay(5_000)
+    session.stopRecord()
 }
 ```
 
@@ -481,21 +499,21 @@ sequenceDiagram
 
 ```kotlin
 lifecycleScope.launch {
-  val session = OSR.recorder(context) {
-    video { width = 1080; height = 1920; fps = 30 }
-    output { file = File(getExternalFilesDir(null), "anim.mp4") }
+    val session = OSR.recorder(context) {
+        video { width = 1080; height = 1920; fps = 30 }
+        output { file = File(getExternalFilesDir(null), "anim.mp4") }
 
-    fbo {
-      view { AnimCircleView(context) }
-      filters {
-        roundCorner { radius = 20f }
-      }
+        fbo {
+            view { AnimCircleView(context) }
+            filters {
+                roundCorner { radius = 20f }
+            }
+        }
     }
-  }
 
-  session.startRecord()
-  delay(3_000)
-  session.stopRecord()
+    session.startRecord()
+    delay(3_000)
+    session.stopRecord()
 }
 ```
 
@@ -560,34 +578,34 @@ sequenceDiagram
 ```kotlin
 class FilterPipeline {
     private val filters = mutableListOf<Filter>()
-  private var initialized = false
+    private var initialized = false
 
-  fun isEmpty(): Boolean = filters.isEmpty()
+    fun isEmpty(): Boolean = filters.isEmpty()
 
-  fun setFilters(list: List<Filter>) {
-    filters.clear()
-    filters.addAll(list)
+    fun setFilters(list: List<Filter>) {
+        filters.clear()
+        filters.addAll(list)
     }
 
-  fun init(width: Int, height: Int) {
-    filters.forEach { it.init(width, height) }
-    initialized = true
-  }
+    fun init(width: Int, height: Int) {
+        filters.forEach { it.init(width, height) }
+        initialized = true
+    }
 
-  fun render(inputTexture: Int): Int {
-    if (!initialized || filters.isEmpty()) return inputTexture
-    var current = inputTexture
-    filters.forEach { filter ->
-      current = filter.apply(current)
+    fun render(inputTexture: Int): Int {
+        if (!initialized || filters.isEmpty()) return inputTexture
+        var current = inputTexture
+        filters.forEach { filter ->
+            current = filter.apply(current)
         }
         return current
     }
 
-  fun release() {
-    filters.forEach { it.release() }
-    filters.clear()
-    initialized = false
-  }
+    fun release() {
+        filters.forEach { it.release() }
+        filters.clear()
+        initialized = false
+    }
 }
 ```
 
@@ -743,27 +761,28 @@ package osp.osr.fbo
  * 解耦后 FrameSource 可独立测试（传入 mock callback）。
  */
 interface FrameCaptureCallback {
-  /** GL 环境就绪时调用，FrameSource 负责在 onSurfaceCreated 中调此方法 */
-  fun onGLReady(display: EGLDisplay, context: EGLContext)
+    /** GL 环境就绪时调用，FrameSource 负责在 onSurfaceCreated 中调此方法 */
+    fun onGLReady(display: EGLDisplay, context: EGLContext)
 
-  /** 每帧调用，执行帧捕获 + 滤镜 + 编码 */
-  fun onFrameAvailable(skipEglRestore: Boolean = false)
+    /** 每帧调用，执行帧捕获 + 滤镜 + 编码 */
+    fun onFrameAvailable(skipEglRestore: Boolean = false)
 }
 
 interface FrameSource {
-  /** 初始化并开始帧捕获，绑定回调 */
-  fun start(callback: FrameCaptureCallback)
+    /** 初始化并开始帧捕获，绑定回调 */
+    fun start(callback: FrameCaptureCallback)
 
-  /** 停止帧捕获，释放资源 */
-  fun stop()
+    /** 停止帧捕获，释放资源 */
+    fun stop()
 }
 ```
 
 `FrameCaptureRenderer` 实现 `FrameCaptureCallback`：
+
 ```kotlin
 class FrameCaptureRenderer(...) : FrameCaptureCallback {
-  override fun onGLReady(display: EGLDisplay, context: EGLContext) = initGL(display, context)
-  override fun onFrameAvailable(skipEglRestore: Boolean) = captureFrame(skipEglRestore)
+    override fun onGLReady(display: EGLDisplay, context: EGLContext) = initGL(display, context)
+    override fun onFrameAvailable(skipEglRestore: Boolean) = captureFrame(skipEglRestore)
 }
 ```
 
@@ -803,6 +822,7 @@ class FrameCaptureRenderer(...) : FrameCaptureCallback {
 - **GL 线程**：`BitmapTextureUploader.upload()` -> FBO 纹理 -> 滤镜 -> 编码
 
 **性能关键**：Bitmap + Canvas 预分配复用，避免每帧 GC：
+
 ```kotlin
 // ViewSource 初始化时一次性创建
 private val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -830,114 +850,114 @@ ViewSource 内部需创建 `OffscreenEglEnv`（与 Mode 3 共享实现）作为 
  * 线程模型：所有方法在 GL 线程调用，startCapture/stopCapture/release 除外（Session 线程）。
  */
 class FrameCaptureRenderer(
-  private val width: Int,
-  private val height: Int,
-  private val filterPipeline: FilterPipeline,
-  private val encoderSurface: Surface
+    private val width: Int,
+    private val height: Int,
+    private val filterPipeline: FilterPipeline,
+    private val encoderSurface: Surface
 ) : FrameCaptureCallback {
 
-  private var fboId = 0
-  private var fboTextureId = 0
-  private lateinit var eglManager: EglSurfaceManager
-  private lateinit var textureProgram: TextureProgram
+    private var fboId = 0
+    private var fboTextureId = 0
+    private lateinit var eglManager: EglSurfaceManager
+    private lateinit var textureProgram: TextureProgram
 
-  /** @Volatile：Session 线程写，GL 线程读，保证跨线程可见性 */
-  @Volatile
-  private var recording = false
-  @Volatile
-  private var initialized = false
+    /** @Volatile：Session 线程写，GL 线程读，保证跨线程可见性 */
+    @Volatile
+    private var recording = false
+    @Volatile
+    private var initialized = false
 
-  // ── FrameCaptureCallback 实现 ──
+    // ── FrameCaptureCallback 实现 ──
 
-  override fun onGLReady(display: EGLDisplay, context: EGLContext) = initGL(display, context)
-  override fun onFrameAvailable(skipEglRestore: Boolean) = captureFrame(skipEglRestore)
+    override fun onGLReady(display: EGLDisplay, context: EGLContext) = initGL(display, context)
+    override fun onFrameAvailable(skipEglRestore: Boolean) = captureFrame(skipEglRestore)
 
-  // ── GL 线程方法 ──
+    // ── GL 线程方法 ──
 
-  private fun initGL(eglDisplay: EGLDisplay, eglContext: EGLContext) {
-    val version = IntArray(2)
-    GLES30.glGetIntegerv(GLES30.GL_MAJOR_VERSION, version, 0)
-    require(version[0] >= 3) { "FBO 策略需要 OpenGL ES 3.0+，当前 ${version[0]}.${version[1]}" }
+    private fun initGL(eglDisplay: EGLDisplay, eglContext: EGLContext) {
+        val version = IntArray(2)
+        GLES30.glGetIntegerv(GLES30.GL_MAJOR_VERSION, version, 0)
+        require(version[0] >= 3) { "FBO 策略需要 OpenGL ES 3.0+，当前 ${version[0]}.${version[1]}" }
 
-    createFbo(width, height)
-    eglManager = EglSurfaceManager(eglDisplay, eglContext, encoderSurface)
-    textureProgram = TextureProgram()
-    filterPipeline.init(width, height)
-    initialized = true
-  }
-
-  private fun captureFrame(skipEglRestore: Boolean = false) {
-    if (!recording || !initialized) return
-    val startNs = System.nanoTime()
-
-    // Step 1: 查询并保存当前帧缓冲绑定 + Viewport 尺寸
-    val savedFbo = IntArray(1)
-    GLES30.glGetIntegerv(GLES30.GL_FRAMEBUFFER_BINDING, savedFbo, 0)
-    val viewport = IntArray(4)
-    GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
-
-    // Step 2: 拷贝当前帧缓冲到 FBO（源尺寸 = Viewport，目标 = 视频尺寸，GL_LINEAR 自动缩放）
-    GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, savedFbo[0])
-    GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, fboId)
-    GLES30.glBlitFramebuffer(
-      0, 0, viewport[2], viewport[3],
-      0, 0, width, height,
-      GLES30.GL_COLOR_BUFFER_BIT, GLES30.GL_LINEAR
-    )
-
-    // Step 3: 滤镜链处理（无滤镜时短路）
-    val outputTexture = if (filterPipeline.isEmpty()) fboTextureId
-    else filterPipeline.render(fboTextureId)
-
-    // Step 4: 保存当前 EGL Surface（离屏模式可跳过）
-    var savedReadSurface: android.opengl.EGLSurface? = null
-    var savedDrawSurface: android.opengl.EGLSurface? = null
-    if (!skipEglRestore) {
-      savedReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
-      savedDrawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        createFbo(width, height)
+        eglManager = EglSurfaceManager(eglDisplay, eglContext, encoderSurface)
+        textureProgram = TextureProgram()
+        filterPipeline.init(width, height)
+        initialized = true
     }
 
-    // Step 5-6: 切换到编码器 Surface，绘制编码。try/finally 保证异常时恢复宿主 EGL。
-    try {
-      eglManager.makeCurrent()
-      GLES30.glViewport(0, 0, width, height)
-      textureProgram.draw(outputTexture)
-      eglManager.swapBuffers()
-    } finally {
-      if (!skipEglRestore) {
-        EGL14.eglMakeCurrent(
-          eglManager.display, savedDrawSurface, savedReadSurface,
-          EGL14.eglGetCurrentContext()
+    private fun captureFrame(skipEglRestore: Boolean = false) {
+        if (!recording || !initialized) return
+        val startNs = System.nanoTime()
+
+        // Step 1: 查询并保存当前帧缓冲绑定 + Viewport 尺寸
+        val savedFbo = IntArray(1)
+        GLES30.glGetIntegerv(GLES30.GL_FRAMEBUFFER_BINDING, savedFbo, 0)
+        val viewport = IntArray(4)
+        GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
+
+        // Step 2: 拷贝当前帧缓冲到 FBO（源尺寸 = Viewport，目标 = 视频尺寸，GL_LINEAR 自动缩放）
+        GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, savedFbo[0])
+        GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, fboId)
+        GLES30.glBlitFramebuffer(
+            0, 0, viewport[2], viewport[3],
+            0, 0, width, height,
+            GLES30.GL_COLOR_BUFFER_BIT, GLES30.GL_LINEAR
         )
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, savedFbo[0])
-      }
+
+        // Step 3: 滤镜链处理（无滤镜时短路）
+        val outputTexture = if (filterPipeline.isEmpty()) fboTextureId
+        else filterPipeline.render(fboTextureId)
+
+        // Step 4: 保存当前 EGL Surface（离屏模式可跳过）
+        var savedReadSurface: android.opengl.EGLSurface? = null
+        var savedDrawSurface: android.opengl.EGLSurface? = null
+        if (!skipEglRestore) {
+            savedReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+            savedDrawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        }
+
+        // Step 5-6: 切换到编码器 Surface，绘制编码。try/finally 保证异常时恢复宿主 EGL。
+        try {
+            eglManager.makeCurrent()
+            GLES30.glViewport(0, 0, width, height)
+            textureProgram.draw(outputTexture)
+            eglManager.swapBuffers()
+        } finally {
+            if (!skipEglRestore) {
+                EGL14.eglMakeCurrent(
+                    eglManager.display, savedDrawSurface, savedReadSurface,
+                    EGL14.eglGetCurrentContext()
+                )
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, savedFbo[0])
+            }
+        }
+
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000f
+        if (elapsedMs > 8f) {
+            OsrLog.w("captureFrame took %.1fms, may cause jank on host".format(elapsedMs))
+        }
     }
 
-    val elapsedMs = (System.nanoTime() - startNs) / 1_000_000f
-    if (elapsedMs > 8f) {
-      OsrLog.w("captureFrame took %.1fms, may cause jank on host".format(elapsedMs))
+    // ── Session 线程方法 ──
+
+    fun startCapture() {
+        recording = true
     }
-  }
+    fun stopCapture() {
+        recording = false
+    }
 
-  // ── Session 线程方法 ──
-
-  fun startCapture() {
-    recording = true
-  }
-  fun stopCapture() {
-    recording = false
-  }
-
-  /** 防重入：已释放或从未初始化时直接返回，每步 runCatching 防止连锁失败 */
-  fun release() {
-    if (!initialized) return
-    initialized = false
-    recording = false
-    runCatching { filterPipeline.release() }
-    runCatching { textureProgram.release() }
-    runCatching { eglManager.release() }
-    runCatching { deleteFbo() }
-  }
+    /** 防重入：已释放或从未初始化时直接返回，每步 runCatching 防止连锁失败 */
+    fun release() {
+        if (!initialized) return
+        initialized = false
+        recording = false
+        runCatching { filterPipeline.release() }
+        runCatching { textureProgram.release() }
+        runCatching { eglManager.release() }
+        runCatching { deleteFbo() }
+    }
 }
 ```
 
@@ -963,32 +983,32 @@ class FrameCaptureRenderer(
 
 /** PTS 归零器：记录首帧基准，后续帧减去基准得到相对时间 */
 internal class PtsNormalizer {
-  private var firstPts = -1L
-  var lastPts = 0L; private set
+    private var firstPts = -1L
+    var lastPts = 0L; private set
 
-  fun normalize(info: MediaCodec.BufferInfo) {
-    val raw = info.presentationTimeUs
-    if (firstPts < 0) firstPts = raw
-    val normalized = raw - firstPts
-    info.presentationTimeUs = normalized
-    lastPts = normalized
-  }
+    fun normalize(info: MediaCodec.BufferInfo) {
+        val raw = info.presentationTimeUs
+        if (firstPts < 0) firstPts = raw
+        val normalized = raw - firstPts
+        info.presentationTimeUs = normalized
+        lastPts = normalized
+    }
 }
 
 /** Listener 通知器：统一 try-catch，防止用户回调异常传播 */
 internal class SessionNotifier(private val listener: ListenerConfig) {
-  fun notifyStart() {
-    runCatching { listener.onStart?.invoke() }
-  }
-  fun notifyStop() {
-    runCatching { listener.onStop?.invoke() }
-  }
-  fun notifySaved(file: File) {
-    runCatching { listener.onSaved?.invoke(file) }
-  }
-  fun notifyError(error: RecorderError) {
-    runCatching { listener.onError?.invoke(error) }
-  }
+    fun notifyStart() {
+        runCatching { listener.onStart?.invoke() }
+    }
+    fun notifyStop() {
+        runCatching { listener.onStop?.invoke() }
+    }
+    fun notifySaved(file: File) {
+        runCatching { listener.onSaved?.invoke(file) }
+    }
+    fun notifyError(error: RecorderError) {
+        runCatching { listener.onError?.invoke(error) }
+    }
 }
 ```
 
@@ -996,140 +1016,140 @@ internal class SessionNotifier(private val listener: ListenerConfig) {
 
 ```kotlin
 internal class FboRecorderSession(
-  context: Context,
-  private val config: RecorderConfig,
-  private val fboConfig: FboConfig
+    context: Context,
+    private val config: RecorderConfig,
+    private val fboConfig: FboConfig
 ) : RecorderSession {
 
-  private val state = AtomicReference(RecorderState.IDLE)
-  private val recorderScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val state = AtomicReference(RecorderState.IDLE)
+    private val recorderScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-  private val encoderController = EncoderController(config.videoConfig)
-  private val muxerController = MuxerController(
-    config.outputConfig.file ?: throw RecorderError.MuxerError("未设置输出文件")
-  )
-  private val audioMixer: AudioMixer? = config.audioConfig.file?.let { AudioMixer(it, muxerController) }
+    private val encoderController = EncoderController(config.videoConfig)
+    private val muxerController = MuxerController(
+        config.outputConfig.file ?: throw RecorderError.MuxerError("未设置输出文件")
+    )
+    private val audioMixer: AudioMixer? = config.audioConfig.file?.let { AudioMixer(it, muxerController) }
 
-  private val filterPipeline = FilterPipeline()
-  private lateinit var captureRenderer: FrameCaptureRenderer
-  private lateinit var frameSource: FrameSource
+    private val filterPipeline = FilterPipeline()
+    private lateinit var captureRenderer: FrameCaptureRenderer
+    private lateinit var frameSource: FrameSource
 
-  private val ptsNormalizer = PtsNormalizer()       // DRY：与 PresentationRecorderSession 共享
-  private val notifier = SessionNotifier(config.listenerConfig)  // DRY：统一通知
+    private val ptsNormalizer = PtsNormalizer()       // DRY：与 PresentationRecorderSession 共享
+    private val notifier = SessionNotifier(config.listenerConfig)  // DRY：统一通知
 
-  suspend fun prepare() {
-    checkAndTransition(RecorderState.IDLE, RecorderState.PREPARED)
+    suspend fun prepare() {
+        checkAndTransition(RecorderState.IDLE, RecorderState.PREPARED)
 
-    try {
-      val encoderSurface = encoderController.prepare()
-      muxerController.prepare()
-      audioMixer?.prepare()
+        try {
+            val encoderSurface = encoderController.prepare()
+            muxerController.prepare()
+            audioMixer?.prepare()
 
-      fboConfig.filterConfig?.let { filterPipeline.setFilters(it.filters) }
+            fboConfig.filterConfig?.let { filterPipeline.setFilters(it.filters) }
 
-      captureRenderer = FrameCaptureRenderer(
-        config.videoConfig.width, config.videoConfig.height,  // ISP：只传 width/height
-        filterPipeline, encoderSurface
-      )
+            captureRenderer = FrameCaptureRenderer(
+                config.videoConfig.width, config.videoConfig.height,  // ISP：只传 width/height
+                filterPipeline, encoderSurface
+            )
 
-      // sealed when 穷举创建 FrameSource（描述性错误替代 !!）
-      val sourceConfig = fboConfig.sourceConfig
-        ?: throw RecorderError.ConfigError("必须在 fbo {} 中选择一种录制模式")
-      frameSource = createFrameSource(sourceConfig)
-      frameSource.start(captureRenderer)  // captureRenderer 实现 FrameCaptureCallback
-    } catch (e: Exception) {
-      state.set(RecorderState.RELEASED)
-      releaseResources()
-      notifier.notifyError(wrapError(e))
-      throw e
-    }
-  }
-
-  /** sealed when 穷举：新增模式编译器强制处理 */
-  private fun createFrameSource(config: FrameSourceConfig): FrameSource = when (config) {
-    is FrameSourceConfig.CaptureRenderer -> CaptureRendererSource(config.attach)
-    is FrameSourceConfig.GLSurfaceView -> GLSurfaceViewSource(config.surface, config.renderer)
-    is FrameSourceConfig.Offscreen -> OffscreenRendererSource(config.renderer)
-    is FrameSourceConfig.ViewCapture -> ViewSource(config.provider)
-  }
-
-  override fun startRecord() {
-    checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
-
-    try {
-      captureRenderer.startCapture()
-      encoderController.start()
-      encoderController.launchEncoderLoop(
-        scope = recorderScope,
-        onFormatChanged = { format ->
-          muxerController.addVideoTrack(format)
-          muxerController.start()
-          audioMixer?.startMixing(recorderScope)
-        },
-        onFrame = { buffer, info ->
-          ptsNormalizer.normalize(info)  // DRY：一行调用替代 6 行重复逻辑
-          muxerController.writeSampleData(
-            muxerController.getVideoTrackIndex(), buffer, info
-          )
+            // sealed when 穷举创建 FrameSource（描述性错误替代 !!）
+            val sourceConfig = fboConfig.sourceConfig
+                ?: throw RecorderError.ConfigError("必须在 fbo {} 中选择一种录制模式")
+            frameSource = createFrameSource(sourceConfig)
+            frameSource.start(captureRenderer)  // captureRenderer 实现 FrameCaptureCallback
+        } catch (e: Exception) {
+            state.set(RecorderState.RELEASED)
+            releaseResources()
+            notifier.notifyError(wrapError(e))
+            throw e
         }
-      )
-      notifier.notifyStart()
-    } catch (e: Exception) {
-      state.set(RecorderState.RELEASED)
-      releaseResources()
-      notifier.notifyError(wrapError(e))
-      throw e
     }
-  }
 
-  override fun stopRecord() {
-    checkAndTransition(RecorderState.RECORDING, RecorderState.STOPPING)
-    captureRenderer.stopCapture()
+    /** sealed when 穷举：新增模式编译器强制处理 */
+    private fun createFrameSource(config: FrameSourceConfig): FrameSource = when (config) {
+        is FrameSourceConfig.CaptureRenderer -> CaptureRendererSource(config.attach)
+        is FrameSourceConfig.GLSurfaceView -> GLSurfaceViewSource(config.surface, config.renderer)
+        is FrameSourceConfig.Offscreen -> OffscreenRendererSource(config.renderer)
+        is FrameSourceConfig.ViewCapture -> ViewSource(config.provider)
+    }
 
-    recorderScope.launch {
-      try {
-        encoderController.signalEndOfStream()
-        encoderController.done.await()
-        audioMixer?.stopMixing()
-        muxerController.stop()
+    override fun startRecord() {
+        checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
 
-        notifier.notifyStop()
-        config.outputConfig.file?.let { notifier.notifySaved(it) }
-      } catch (e: Exception) {
-        notifier.notifyError(wrapError(e))
-      } finally {
-        state.set(RecorderState.RELEASED)
+        try {
+            captureRenderer.startCapture()
+            encoderController.start()
+            encoderController.launchEncoderLoop(
+                scope = recorderScope,
+                onFormatChanged = { format ->
+                    muxerController.addVideoTrack(format)
+                    muxerController.start()
+                    audioMixer?.startMixing(recorderScope)
+                },
+                onFrame = { buffer, info ->
+                    ptsNormalizer.normalize(info)  // DRY：一行调用替代 6 行重复逻辑
+                    muxerController.writeSampleData(
+                        muxerController.getVideoTrackIndex(), buffer, info
+                    )
+                }
+            )
+            notifier.notifyStart()
+        } catch (e: Exception) {
+            state.set(RecorderState.RELEASED)
+            releaseResources()
+            notifier.notifyError(wrapError(e))
+            throw e
+        }
+    }
+
+    override fun stopRecord() {
+        checkAndTransition(RecorderState.RECORDING, RecorderState.STOPPING)
+        captureRenderer.stopCapture()
+
+        recorderScope.launch {
+            try {
+                encoderController.signalEndOfStream()
+                encoderController.done.await()
+                audioMixer?.stopMixing()
+                muxerController.stop()
+
+                notifier.notifyStop()
+                config.outputConfig.file?.let { notifier.notifySaved(it) }
+            } catch (e: Exception) {
+                notifier.notifyError(wrapError(e))
+            } finally {
+                state.set(RecorderState.RELEASED)
+                releaseResources()
+            }
+        }
+    }
+
+    override fun release() {
+        val prev = state.getAndSet(RecorderState.RELEASED)
+        if (prev == RecorderState.RELEASED) return
         releaseResources()
-      }
     }
-  }
 
-  override fun release() {
-    val prev = state.getAndSet(RecorderState.RELEASED)
-    if (prev == RecorderState.RELEASED) return
-    releaseResources()
-  }
+    override fun getState() = state.get()
 
-  override fun getState() = state.get()
-
-  /** 每步 runCatching：一个组件释放失败不阻止其余组件释放 */
-  private fun releaseResources() {
-    runCatching { frameSource.stop() }
-    runCatching { captureRenderer.release() }
-    runCatching { encoderController.release() }
-    runCatching { audioMixer?.release() }
-    runCatching { muxerController.release() }
-    recorderScope.cancel()
-  }
-
-  private fun checkAndTransition(expected: RecorderState, next: RecorderState) {
-    if (!state.compareAndSet(expected, next)) {
-      throw RecorderError.EncoderError("非法状态转换: 期望 $expected, 实际 ${state.get()}")
+    /** 每步 runCatching：一个组件释放失败不阻止其余组件释放 */
+    private fun releaseResources() {
+        runCatching { frameSource.stop() }
+        runCatching { captureRenderer.release() }
+        runCatching { encoderController.release() }
+        runCatching { audioMixer?.release() }
+        runCatching { muxerController.release() }
+        recorderScope.cancel()
     }
-  }
 
-  private fun wrapError(e: Exception): RecorderError =
-    if (e is RecorderError) e else RecorderError.EncoderError("录制异常", e)
+    private fun checkAndTransition(expected: RecorderState, next: RecorderState) {
+        if (!state.compareAndSet(expected, next)) {
+            throw RecorderError.EncoderError("非法状态转换: 期望 $expected, 实际 ${state.get()}")
+        }
+    }
+
+    private fun wrapError(e: Exception): RecorderError =
+        if (e is RecorderError) e else RecorderError.EncoderError("录制异常", e)
 }
 ```
 
@@ -1312,45 +1332,3 @@ internal class FboRecorderSession(
 | **KISS**       | sealed interface 替代 4 个 SourceFactory 类                                    | 省 4 个文件，编译器穷举     |
 | **防御性编程**      | `@Volatile` 线程安全；`runCatching` 释放容错；`try/finally` EGL 保护；`initialized` 防竞态 | 健壮性               |
 | **Kotlin 惯用法** | sealed interface + when 穷举；data class 配置；runCatching；`@RecorderDsl`        | 代码简洁、类型安全         |
-
----
-
-## 十五、FBO 代码注释规范与总结
-
-FBO 包下（含 `gl/`、`filter/`、`source/`）已按「小白友好、活泼、带 emoji」补充详细注释，重点说明**为什么这么做**以及**代码/数据流转到类+方法**
-。以下为注释总结，便于维护与续写时保持一致风格。
-
-### 15.1 注释风格约定
-
-- **语气**：口语化（如「干啥的」「谁调我」「之后发生啥」），可用 emoji（🛠️ 📸 🎬 🖼️ 🔗 📌 🌫️ 🌊 📐 等）。
-- **必写内容**：
-  - 类/方法职责（一句话 + 可选「谁调我 / 谁用」）；
-  - 关键步骤的**原因**（为什么用 FBO、为什么两趟模糊、为什么保存 EGL 等）；
-  - **数据流**：做完这一步后，**哪个类、哪个方法**会执行（到类+方法级别），便于顺调用链阅读。
-
-### 15.2 gl 包注释要点（最详细）
-
-| 文件                    | 类/方法注释要点                                                                                                                                                          |
-|-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **GlUtil**            | 三大职责（编译 shader/program、创建 FBO+纹理、画全屏四边形）；`createProgram` / `createFboWithTexture` / `drawTexture` 的流程、返回含义、**谁调我**、**之后发生啥**（GPU 执行到哪、写到哪）；四边形顶点与 FloatBuffer 用途。 |
-| **EglHelper**         | EGL 是什么、为何要离屏；**数据流**（谁创建、init 后谁 makeCurrent、典型调用顺序）；`init` 为何要 GLES3、`createPbufferSurface` 时机、`makeCurrent` 之后绘制目标、`release` 谁调。                               |
-| **EglSurfaceManager** | 与 EglHelper 的区别；**数据流**（谁造、makeCurrent/swapBuffers 作用）；**典型一帧流程**（步骤 1–4，到类+方法）。                                                                                  |
-| **TextureProgram**    | 在管线中的角色（最后一步：滤镜输出 → 编码器 Surface）；**数据流**（谁造、谁调 draw、draw 内部到 GlUtil）；shader 在做什么。                                                                                 |
-
-### 15.3 其他 FBO 文件注释要点
-
-| 文件/模块                                                  | 注释要点                                                                                                        |
-|--------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
-| **FrameCaptureRenderer**                               | 类注释：一整帧的**数据流（类+方法）**（从 FrameSource 调 `captureFrame()` 到 finally 恢复宿主）；`initGL` / `captureFrame` 的谁调、之后谁执行。 |
-| **FboConfig / FboStrategy**                            | FrameSourceConfig 四种模式各一句话 + 谁用；FboStrategy 谁调、createSession 后的数据流。                                         |
-| **FboRecorderSession**                                 | 类注释：**数据流简图**（从 OSR.recorder 到 onFrame 写 Muxer）；prepare / startRecord / stopRecord 中关键步骤的「谁调、之后哪个类/方法执行」。   |
-| **Filter / FilterPipeline**                            | 接口职责、数据流（init/apply/release 谁调）、管线链式执行说明。                                                                   |
-| **FrameSource / FrameCaptureCallback**                 | 帧源概念、四种实现、依赖倒置。                                                                                             |
-| **四种 FrameSource 实现**                                  | 每种「小白一句话」+ **数据流**（到类+方法）；关键回调（如 onDrawFrame）里注明「此时谁被调、画面到哪」。                                               |
-| **BlurFilter / WaterRippleFilter / RoundCornerFilter** | 为何两趟模糊、水波纹/圆角思路、**数据流**（apply 输入 → uniform → 片元 → 输出纹理）。                                                    |
-
-### 15.4 维护建议
-
-- 新增 gl 包类/方法：按 15.2 的粒度补全「谁调 / 谁用 / 之后谁执行」。
-- 新增 Filter 或 FrameSource：在类注释里写清「小白一句话」+ 数据流（到类+方法）。
-- 修改管线或调用链时，顺带更新相关注释里的「之后谁执行」，避免注释与实现脱节。

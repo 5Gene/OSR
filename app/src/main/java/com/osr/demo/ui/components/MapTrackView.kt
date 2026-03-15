@@ -5,7 +5,9 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.util.AttributeSet
+import android.view.View
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.TextView
 import com.amap.api.location.AMapLocationClient.updatePrivacyAgree
 import com.amap.api.location.AMapLocationClient.updatePrivacyShow
@@ -15,6 +17,7 @@ import com.amap.api.maps.CustomRenderer
 import com.amap.api.maps.MapView
 import com.amap.api.maps.model.LatLng
 import com.amap.api.maps.model.PolylineOptions
+import com.osr.demo.R
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -27,7 +30,11 @@ class MapTrackView @JvmOverloads constructor(
     private val mapView: MapView
     private val distanceTextView: TextView
 
+    /** 顶部全屏封面，地图加载完成后 1s 渐变隐藏 */
+    private val coverView: ImageView
+
     private val trackPoints: List<LatLng> = generateTiananmenTrack()
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private var isAnimating = false
     private var currentPointIndex = 0
@@ -61,14 +68,20 @@ class MapTrackView @JvmOverloads constructor(
             map.mapType = AMap.MAP_TYPE_SATELLITE
             map.setOnMapLoadedListener {
                 mapLoadedListener?.onMapLoaded()
+                // 地图加载完成后 1s 渐变隐藏封面
+                mainHandler.postDelayed({
+                    coverView.animate()
+                        .alpha(0f)
+                        .setDuration(300)
+                        .withEndAction { coverView.visibility = View.GONE }
+                }, 1000)
             }
             map.setCustomRenderer(object : CustomRenderer {
                 override fun OnMapReferencechanged() {
-                    println("CustomRenderer => OnMapReferencechanged")
+                    println("CustomRenderer => OnMapReferencechanged ")
                 }
 
                 override fun onDrawFrame(p0: GL10?) {
-//                    println("CustomRenderer => onDrawFrame")
                 }
 
                 override fun onSurfaceChanged(p0: GL10?, p1: Int, p2: Int) {
@@ -90,9 +103,17 @@ class MapTrackView @JvmOverloads constructor(
         }
         addView(mapView)
 
+        // 顶部全屏封面，默认显示，地图加载完成 1s 后渐变隐藏
+        coverView = ImageView(context).apply {
+            layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setImageResource(R.drawable.ic_launcher)
+        }
+        addView(coverView)
+
         // 左下角距离显示 (带圆角背景)
         distanceTextView = TextView(context).apply {
-            text = "距离: 0.00 km"
+            text = "加载中"
             setTextColor(Color.WHITE)
             textSize = 16f
             setTypeface(Typeface.DEFAULT, Typeface.BOLD)
@@ -120,9 +141,15 @@ class MapTrackView @JvmOverloads constructor(
 
     }
 
+    /** 设置封面图片资源，不设置则使用默认 drawable */
+    fun setCoverImageResource(resId: Int) {
+        coverView.setImageResource(resId)
+    }
+
     /** 设置地图加载完成监听 */
     fun setOnMapLoadedListener(listener: OnMapLoadedListener?) {
         mapLoadedListener = listener
+        distanceTextView.text = "加载成功"
     }
 
     /** 设置轨迹动画结束监听 */
@@ -223,7 +250,7 @@ class MapTrackView @JvmOverloads constructor(
         val a = 0.008
         val b = 0.005
 
-        for (i in 0 until 100) {
+        for (i in 0 until 200) {
             val angle = (i.toDouble() / 100) * 2 * Math.PI
             val lat = centerLat + b * Math.sin(angle)
             val lng = centerLng + a * Math.cos(angle)
