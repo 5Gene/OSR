@@ -128,19 +128,19 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     }
-                    presentation { display, session ->
-                        MapTrackPresentation(this@MainActivity, display, session)
-//                        ColorChangePresentation(this@MainActivity, display, session)
-                    }
-//                    fbo {
-//                        view { session ->
-//                            ColorChangeView(this@MainActivity).apply {
-//                                onStart = { session.startRecord() }
-//                                onEnd = { session.stopRecord() }
-//                                start()
-//                            }
-//                        }
+//                    presentation { display, session ->
+//                        MapTrackPresentation(this@MainActivity, display, session)
+////                        ColorChangePresentation(this@MainActivity, display, session)
 //                    }
+                    fbo {
+                        view { session ->
+                            ColorChangeView(this@MainActivity).apply {
+                                onStart = { session.startRecord() }
+                                onEnd = { session.stopRecord() }
+                                start()
+                            }
+                        }
+                    }
                 }
                 recorderSession = newSession
             } catch (e: Exception) {
