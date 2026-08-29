@@ -170,12 +170,7 @@ class FrameCaptureRenderer(
 
             // 滤镜链：fboTexId → 模糊/水波纹/圆角… → 返回最终纹理，下一句会把它画到编码器
             val outputTex = filterPipeline.render(fboTexId)
-
-            eglSurfaceManager?.makeCurrent()
-            GLES30.glViewport(0, 0, width, height)
-            GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
-            textureProgram?.draw(outputTex)
-            eglSurfaceManager?.swapBuffers()
+            renderTextureToEncoder(outputTex)
         } finally {
             if (!skipEglRestore) {
                 // 恢复宿主 GL 状态，避免下一帧出现闪烁或透明度异常
@@ -187,6 +182,39 @@ class FrameCaptureRenderer(
                 EGL14.eglMakeCurrent(hostDisplay, hostDrawSurface, hostReadSurface, hostContext)
             }
         }
+    }
+
+    /**
+     * ViewSource 的 Bitmap 已上传为纹理，直接进入滤镜链，避免从未绘制的 PBuffer 读取黑帧。
+     */
+    override fun captureTexture(textureId: Int) {
+        if (!initialized || !recording || textureId == 0) return
+
+        val sourceDisplay = EGL14.eglGetCurrentDisplay()
+        val sourceDrawSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val sourceReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+        val sourceContext = EGL14.eglGetCurrentContext()
+
+        try {
+            val outputTexture = filterPipeline.render(textureId)
+            renderTextureToEncoder(outputTexture)
+        } finally {
+            // ViewCapture 下一帧仍需在自己的 PBuffer Context 中上传纹理。
+            EGL14.eglMakeCurrent(
+                sourceDisplay,
+                sourceDrawSurface,
+                sourceReadSurface,
+                sourceContext
+            )
+        }
+    }
+
+    private fun renderTextureToEncoder(textureId: Int) {
+        eglSurfaceManager?.makeCurrent()
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        textureProgram?.draw(textureId)
+        eglSurfaceManager?.swapBuffers()
     }
 
     fun release() {

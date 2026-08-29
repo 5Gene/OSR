@@ -2,6 +2,7 @@ package osp.osr.pres
 
 import android.content.Context
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,16 +23,15 @@ import osp.osr.dsl.RecorderConfig
 import osp.osr.log.OsrLog
 import osp.osr.model.RecorderError
 import osp.osr.model.RecorderState
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 🎬 Presentation 方案的录制会话实现
  *
- * **编排链路**：EncoderController（Surface）→ VirtualDisplayManager（Display）→ PresentationController（Presentation）
- * 编码输出通过 onFrame 回调直接写 Muxer（无 Channel 中间层）；AudioMixer 在录制期间实时并行写音频轨。
+ * **状态机**：IDLE → PREPARING → PREPARED → RECORDING → STOPPING → RELEASED
  *
- * **设计模式：状态机** 🎯
- * 用 [AtomicReference] + CAS 做合法状态转换，避免重复 start/stop、未 prepare 就 start 等非法调用。
+ * Presentation.onCreate 内可安全调用 [startRecord]：会挂起等待 show/settle 完成后再真正启动。
  */
 internal class PresentationRecorderSession(
     private val context: Context,
@@ -41,6 +41,8 @@ internal class PresentationRecorderSession(
 
     private val state = AtomicReference(RecorderState.IDLE)
     private val recorderScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val prepared = CompletableDeferred<Unit>()
+    private val startRequested = AtomicBoolean(false)
 
     private val encoderController = EncoderController(config.videoConfig)
     private val muxerController = MuxerController(
@@ -56,14 +58,13 @@ internal class PresentationRecorderSession(
     private val notifier = SessionNotifier(config.listenerConfig)
 
     /**
-     * 🛠️ prepare：搭好管线（encoder/muxer/display/show），**不**启动编码器。
-     * 等画面就绪（如地图加载完）后调 startRecord()，再 encoder.start()，首帧就是那时的画面。
+     * 🛠️ prepare：搭好管线（encoder/muxer/display/show），完成后才进入 PREPARED 并放行 startRecord。
      */
     suspend fun prepare() {
         val outputPath = config.outputConfig.file?.absolutePath ?: ""
         OsrLog.i("prepare start output=$outputPath")
-        OsrLog.d("prepare IDLE -> PREPARED")
-        checkAndTransition(RecorderState.IDLE, RecorderState.PREPARED)
+        OsrLog.d("prepare IDLE -> PREPARING")
+        checkAndTransition(RecorderState.IDLE, RecorderState.PREPARING)
 
         try {
             encoderController.prepare()
@@ -92,9 +93,13 @@ internal class PresentationRecorderSession(
             OsrLog.d("🖥️ VirtualDisplay ready densityDpi=$densityDpi")
             presentationController.show(display, this)
             delay(PRESENTATION_SETTLE_MS)
+
+            checkAndTransition(RecorderState.PREPARING, RecorderState.PREPARED)
+            prepared.complete(Unit)
             OsrLog.i("✅ prepare done PREPARED encode=${config.videoConfig.width}x${config.videoConfig.height}")
         } catch (e: Exception) {
             OsrLog.e("prepare failed output=$outputPath", e)
+            prepared.cancel(CancellationException("prepare failed", e))
             state.set(RecorderState.RELEASED)
             releaseResources()
             notifier.notifyError(wrapError(e))
@@ -103,60 +108,71 @@ internal class PresentationRecorderSession(
     }
 
     /**
-     * ▶️ startRecord：codec.start + 编码循环后，reattach VD，等第一帧再 [onReady] / onStart。
+     * ▶️ 申请开始录制。prepare 未完成时挂起等待；完成后进入 RECORDING + VD 握手。
      */
     override fun startRecord(onReady: (() -> Unit)?) {
-        OsrLog.i("startRecord PREPARED -> RECORDING")
-        checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
-
-        try {
-            encoderController.start()
-            encoderController.launchEncoderLoop(
-                scope = recorderScope,
-                onFormatChanged = { format ->
-                    muxerController.addVideoTrack(format)
-                    muxerController.start()
-                    audioMixer?.startMixing(recorderScope)
-                    OsrLog.d("muxer started, video track added")
-                },
-                onFrame = { buffer, info ->
-                    ptsNormalizer.normalize(info)
-                    muxerController.writeSampleData(
-                        muxerController.getVideoTrackIndex(),
-                        buffer,
-                        info
-                    )
-                }
-            )
-
-            // 🙈 旧写法：start + 开编码循环后立刻 onStart，UI 只能 sleep 1 秒猜「是不是可以演戏了」。
-            // 🎬 Muxer 要等 FORMAT_CHANGED 才开门，之前的帧全进垃圾桶；格式有了也不等于有画面
-            //    （ColorOS 可以「格式到手、像素为零」）。动画开早了缺开头，开晚了片头发呆。
-            // ✅ 等到第一帧真画面（不是 SPS 那种 CODEC_CONFIG）再主线程 onReady 开动画 + notifyStart。
-            // notifier.notifyStart()
-            recorderScope.launch {
-                try {
-                    handshakeUntilFirstFrame()
-                    withContext(Dispatchers.Main.immediate) {
-                        onReady?.invoke()
-                        notifier.notifyStart()
-                        OsrLog.i("🎉 onReady+onStart")
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    OsrLog.e("💀 startRecord handshake failed", e)
-                    state.set(RecorderState.RELEASED)
-                    releaseResources()
-                    notifier.notifyError(wrapError(e))
-                }
+        if (!startRequested.compareAndSet(false, true)) {
+            throw RecorderError.EncoderError("录制已申请启动")
+        }
+        OsrLog.i("startRecord requested, await prepare")
+        recorderScope.launch {
+            try {
+                prepared.await()
+                OsrLog.i("prepare ready → RECORDING")
+                checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
+                startRecordNow(onReady)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                OsrLog.e("startRecord failed", e)
+                state.set(RecorderState.RELEASED)
+                releaseResources()
+                notifier.notifyError(wrapError(e))
             }
-        } catch (e: Exception) {
-            OsrLog.e("startRecord failed", e)
-            state.set(RecorderState.RELEASED)
-            releaseResources()
-            notifier.notifyError(wrapError(e))
-            throw e
+        }
+    }
+
+    private fun startRecordNow(onReady: (() -> Unit)?) {
+        encoderController.start()
+        encoderController.launchEncoderLoop(
+            scope = recorderScope,
+            onFormatChanged = { format ->
+                muxerController.addVideoTrack(format)
+                muxerController.start()
+                audioMixer?.startMixing(recorderScope)
+                OsrLog.d("muxer started, video track added")
+            },
+            onFrame = { buffer, info ->
+                ptsNormalizer.normalize(info)
+                muxerController.writeSampleData(
+                    muxerController.getVideoTrackIndex(),
+                    buffer,
+                    info
+                )
+            }
+        )
+
+        // 🙈 旧写法：start + 开编码循环后立刻 onStart，UI 只能 sleep 1 秒猜「是不是可以演戏了」。
+        // 🎬 Muxer 要等 FORMAT_CHANGED 才开门，之前的帧全进垃圾桶；格式有了也不等于有画面
+        //    （ColorOS 可以「格式到手、像素为零」）。动画开早了缺开头，开晚了片头发呆。
+        // ✅ 等到第一帧真画面（不是 SPS 那种 CODEC_CONFIG）再主线程 onReady 开动画 + notifyStart。
+        // notifier.notifyStart()
+        recorderScope.launch {
+            try {
+                handshakeUntilFirstFrame()
+                withContext(Dispatchers.Main.immediate) {
+                    onReady?.invoke()
+                    notifier.notifyStart()
+                    OsrLog.i("🎉 onReady+onStart")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                OsrLog.e("💀 startRecord handshake failed", e)
+                state.set(RecorderState.RELEASED)
+                releaseResources()
+                notifier.notifyError(wrapError(e))
+            }
         }
     }
 
@@ -223,6 +239,9 @@ internal class PresentationRecorderSession(
         val prev = state.getAndSet(RecorderState.RELEASED)
         OsrLog.i("release state $prev -> RELEASED")
         if (prev == RecorderState.RELEASED) return
+        if (!prepared.isCompleted) {
+            prepared.cancel(CancellationException("session released"))
+        }
         releaseResources()
     }
 

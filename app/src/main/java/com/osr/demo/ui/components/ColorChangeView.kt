@@ -2,16 +2,16 @@ package com.osr.demo.ui.components
 
 import android.content.Context
 import android.graphics.Color
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
 import android.widget.FrameLayout
 
 /**
  * 按固定 fps 循环切换背景色的自定义 View，用于录制等场景。
  *
- * 使用方式：
- * - 设置 [onStart] / [onEnd] 回调（如录制的 startRecord/stopRecord）
- * - 调用 [start] 开始循环，结束时自动调用 [onEnd]
- * - 可调用 [stop] 提前结束
+ * 推荐：`session.startRecord(onReady = { start() })`，第一帧后再开动画；
+ * [onEnd] 里调 `stopRecord`。勿在 [start] 之前先播动画再申请录制。
  */
 class ColorChangeView @JvmOverloads constructor(
     context: Context,
@@ -48,8 +48,9 @@ class ColorChangeView @JvmOverloads constructor(
     private var currentFrame = 0
     private var totalFrames = 0
     private var scheduleRunnable: Runnable? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** 开始循环切换背景色；结束时自动调用 [onEnd]。 */
+    /** 开始循环切换背景色；结束时自动调用 [onEnd]。应放在 startRecord(onReady) 里调用。 */
     fun start() {
         stop()
         currentFrame = 0
@@ -60,7 +61,7 @@ class ColorChangeView @JvmOverloads constructor(
 
     /** 提前结束循环，不会调用 [onEnd]。 */
     fun stop() {
-        scheduleRunnable?.let { removeCallbacks(it) }
+        scheduleRunnable?.let(mainHandler::removeCallbacks)
         scheduleRunnable = null
     }
 
@@ -74,7 +75,8 @@ class ColorChangeView @JvmOverloads constructor(
         invalidate()
         currentFrame++
         scheduleRunnable = Runnable { scheduleNext() }
-        postDelayed(scheduleRunnable!!, 1000L / fps)
+        // 离屏 View 未 attach，使用主线程 Handler 才能持续推进动画。
+        mainHandler.postDelayed(scheduleRunnable!!, 1000L / fps)
     }
 
     override fun onDetachedFromWindow() {

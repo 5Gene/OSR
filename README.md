@@ -22,7 +22,7 @@ App 不截真实屏幕，而是造一块「假屏幕」（VirtualDisplay），�
 
 ### 两阶段：先搭台子，再开拍
 
-状态机：`IDLE → PREPARED → RECORDING → STOPPING → RELEASED`。
+状态机：`IDLE → PREPARING → PREPARED → RECORDING → STOPPING → RELEASED`。
 
 **阶段 A：`prepare()`（搭台，编码器还没 start）**
 
