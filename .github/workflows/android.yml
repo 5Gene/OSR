@@ -1,0 +1,34 @@
+name: Android CI
+
+#https://docs.github.com/zh/actions/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow
+on: [ push, pull_request ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🐼 Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: 🛠️ Build APK
+        run: |
+          echo 🐛 如果遇到Error: Could not find or load main class org.gradle.wrapper.GradleWrapperMain
+          echo 💊 那么说明是因为gradle目录,gradlew文件没同步到github导致的,检查下是否此目录下有文件没上传
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - run: echo "💡build succeed. 🎉🎉🎉"
+
+      #https://github.blog/news-insights/product-news/get-started-with-v4-of-github-actions-artifacts/
+      - name: 📸 Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

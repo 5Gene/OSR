@@ -1,0 +1,50 @@
+# This is a basic workflow to help you get started with Actions
+
+name: publish
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  release:
+    types: [ published ]
+  push:
+    tags:
+      - 'v*'  # 仅在标签匹配 'v*' 模式时触发
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      - name: 🐼 Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # Runs a single command using the runners shell
+      - name: 🔥 Publishing Plugin
+        run: |
+          echo 🐛 如果遇到Error: Could not find or load main class org.gradle.wrapper.GradleWrapperMain
+          echo 💊 那么说明是因为gradle目录,gradlew文件没同步到github导致的,检查下是否此目录下有文件没上传
+          chmod +x gradlew
+          ./gradlew publishToMavenCentral
+        env:
+          SIGN_GPG_KEY: ${{ secrets.SIGN_GPG_KEY }}
+          SIGN_GPG_PASSWORD: ${{ secrets.SIGN_GPG_PASSWORD }}
+          mavenCentralUsername: ${{ secrets.MAVEN_NAME }}
+          mavenCentralPassword: ${{ secrets.MAVEN_PASSWORD }}
+          GITHUB_USER: ${{ secrets.NAME_GITHUB }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+
+      - run: echo "Published successfully. 🎉🎉🎉 \n 🔗 https://central.sonatype.com/publishing"
