@@ -132,15 +132,81 @@ class MainActivity : AppCompatActivity() {
                         MapTrackPresentation(this@MainActivity, display, session)
 //                        ColorChangePresentation(this@MainActivity, display, session)
                     }
-//                    fbo {
-//                        view { session ->
-//                            ColorChangeView(this@MainActivity).apply {
-//                                onStart = { session.startRecord() }
-//                                onEnd = { session.stopRecord() }
-//                                start()
-//                            }
-//                        }
-//                    }
+                }
+                recorderSession = newSession
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, "创建录制失败: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+
+        }
+    }
+
+    fun recordFbo(view: View) {
+        val session = recorderSession
+        if (session != null) {
+            // 已在录制：停止录制（会话会在 onSaved 中释放）
+            if (session.getState() == osp.osr.model.RecorderState.RECORDING) {
+                session.stopRecord()
+                (view as? Button)?.text = "录制"
+            }
+            return
+        }
+
+        // 未在录制：在协程中创建会话并开始录制
+        lifecycleScope.launch {
+            // Download 目录：优先应用专属外部 Download；若为 null 则在外部 files 下建 Download；最后才用 data/data/files/Download
+            val downloadDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                ?: getExternalFilesDir(null)?.let { File(it, "Download").apply { mkdirs() } }
+                ?: File(filesDir, "Download").apply { mkdirs() }
+            val fileName = "osr_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())}.mp4"
+            val outputFile = File(downloadDir, fileName)
+
+            try {
+                val newSession = OSR.recorder(applicationContext) {
+                    video {
+                        // width/height/dpi 默认屏幕 + 设备 dpi；关掉 MaxFS 强缩以冲高清
+                        strictAvcLevel41 = false
+                        fps = 30
+                        bitrate = 4_000_000
+                    }
+                    output {
+                        file = outputFile
+                    }
+                    audio {
+                        file = rawToFile(R.raw.xiayu, "calm.acc")
+                    }
+                    listener {
+                        onStart = {
+                            runOnUiThread {
+                                (view as? Button)?.text = "停止录制"
+                                Toast.makeText(this@MainActivity, "开始录制", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        onSaved = { file ->
+                            runOnUiThread {
+                                recorderSession = null
+                                (view as? Button)?.text = "录制"
+                                Toast.makeText(this@MainActivity, "已保存: ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                        onError = { error ->
+                            Log.i("OSR", "record: error : ${Log.getStackTraceString(error)}")
+                            runOnUiThread {
+                                recorderSession = null
+                                (view as? Button)?.text = "录制"
+                                Toast.makeText(this@MainActivity, "录制错误: ${error.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                    fbo {
+                        view { session ->
+                            ColorChangeView(this@MainActivity).apply {
+                                onStart = { session.startRecord() }
+                                onEnd = { session.stopRecord() }
+                                start()
+                            }
+                        }
+                    }
                 }
                 recorderSession = newSession
             } catch (e: Exception) {

@@ -14,4 +14,12 @@
         android:onClick="record"
         android:layout_marginTop="20dp"
         android:layout_height="wrap_content" />
+
+    <Button
+        android:layout_width="wrap_content"
+        android:text="FBO录制"
+        android:onClick="recordFbo"
+        android:layout_marginTop="20dp"
+        android:layout_gravity="top|end"
+        android:layout_height="wrap_content" />
 </FrameLayout>
