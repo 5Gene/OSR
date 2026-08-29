@@ -4,13 +4,22 @@ import osp.osr.listener.ListenerConfig
 import osp.osr.render.RenderStrategy
 import java.io.File
 
-/** 📐 视频编码参数（宽高、帧率、码率、关键帧间隔） */
+/** 📐 视频编码参数（宽高、帧率、码率、关键帧间隔、MaxFS 策略、VD dpi） */
 class VideoConfig {
-    var width: Int = 1080
-    var height: Int = 1920
+    /** 0 = OSR.recorder(context) 填成屏幕宽 */
+    var width: Int = 0
+    /** 0 = 填成屏幕高 */
+    var height: Int = 0
     var fps: Int = 30
     var bitrate: Int = 4_000_000
     var iFrameInterval: Int = 1
+    /**
+     * true：一开始就按 MaxFS=8192 纠正宽高再 configure
+     * false：先只 16 对齐 configure；失败再 MaxFS 纠正写回并重配；仍失败才 720p
+     */
+    var strictAvcLevel41: Boolean = true
+    /** 0 = 填成设备 densityDpi；作为 VD 密度基准 */
+    var densityDpi: Int = 0
 }
 
 /**
@@ -95,6 +104,14 @@ class RecorderConfig {
 
         fun setIFrameInterval(interval: Int) = apply {
             config.videoConfig.iFrameInterval = interval
+        }
+
+        fun setStrictAvcLevel41(strict: Boolean) = apply {
+            config.videoConfig.strictAvcLevel41 = strict
+        }
+
+        fun setDensityDpi(dpi: Int) = apply {
+            config.videoConfig.densityDpi = dpi
         }
 
         fun setAudioFile(file: File) = apply {

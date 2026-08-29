@@ -31,12 +31,12 @@ class MuxerController(private val outputFile: File) {
      */
     @Synchronized
     fun prepare() {
-        OsrLog.d("muxer prepare path=${outputFile.absolutePath}")
+        OsrLog.d("📀 muxer prepare path=${outputFile.absolutePath}")
         muxer = MediaMuxer(
             outputFile.absolutePath,
             MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
         )
-        OsrLog.d("muxer created")
+        OsrLog.d("📀 muxer created")
     }
 
     /**
@@ -49,7 +49,7 @@ class MuxerController(private val outputFile: File) {
     fun addVideoTrack(format: MediaFormat): Int {
         val m = muxer ?: throw RecorderError.MuxerError("Muxer 尚未准备")
         videoTrackIndex = m.addTrack(format)
-        OsrLog.d("muxer addVideoTrack index=$videoTrackIndex")
+        OsrLog.i("📀 addVideoTrack index=$videoTrackIndex")
         return videoTrackIndex
     }
 
@@ -62,7 +62,7 @@ class MuxerController(private val outputFile: File) {
     fun addAudioTrack(format: MediaFormat): Int {
         val m = muxer ?: throw RecorderError.MuxerError("Muxer 尚未准备")
         audioTrackIndex = m.addTrack(format)
-        OsrLog.d("addAudioTrack index=$audioTrackIndex")
+        OsrLog.i("🎵 addAudioTrack index=$audioTrackIndex")
         return audioTrackIndex
     }
 
@@ -75,7 +75,7 @@ class MuxerController(private val outputFile: File) {
     @Synchronized
     fun start() {
         if (started) return
-        OsrLog.d("muxer start")
+        OsrLog.i("📀 muxer start videoTrack=$videoTrackIndex audioTrack=$audioTrackIndex")
         muxer?.start() ?: throw RecorderError.MuxerError("Muxer 尚未准备")
         started = true
     }
@@ -102,7 +102,7 @@ class MuxerController(private val outputFile: File) {
     @Synchronized
     fun stop() {
         if (!started) return
-        OsrLog.d("muxer stop")
+        OsrLog.i("⏹️ muxer stop path=${outputFile.absolutePath}")
         try {
             muxer?.stop()
         } catch (_: Exception) {
@@ -115,7 +115,7 @@ class MuxerController(private val outputFile: File) {
      */
     @Synchronized
     fun release() {
-        OsrLog.d("release muxer")
+        OsrLog.d("🧹 muxer release")
         stop()
         try {
             muxer?.release()

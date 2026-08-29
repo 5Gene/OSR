@@ -4,18 +4,15 @@ import android.app.Presentation
 import android.os.Bundle
 import android.view.Display
 import androidx.appcompat.app.AppCompatActivity
-import androidx.lifecycle.lifecycleScope
 import com.osr.demo.ui.components.MapTrackView
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import osp.osr.RecorderSession
 
 /**
  * 用于录制的 Presentation：展示 MapTrackView 动态轨迹动画，
- * 地图加载完成后自动播放轨迹，动画结束后调用 session.stopRecord()。
+ * 地图加载完成后 startRecord；第一帧就绪后再播轨迹，动画结束后 stopRecord。
  */
 class MapTrackPresentation(
-    private val activity: AppCompatActivity,
+    activity: AppCompatActivity,
     display: Display,
     private val session: RecorderSession
 ) : Presentation(activity, display) {
@@ -26,17 +23,12 @@ class MapTrackPresentation(
         setContentView(mapTrackView)
 
         mapTrackView.setOnMapLoadedListener {
-            // 地图加载完成后启动轨迹动画（约 100 点 × 50ms ≈ 5 秒）
-            activity.lifecycleScope.launch {
-                mapTrackView.postInvalidate()
-                session.startRecord()
-                delay(1000)
-                mapTrackView.startTrackAnimation()
-            }
+            // 静态首屏先出画；等编码器第一帧后再开轨迹，避免缺开头
+            mapTrackView.postInvalidate()
+            session.startRecord(onReady = { mapTrackView.startTrackAnimation() })
         }
 
         mapTrackView.setOnAnimationEndListener {
-            // 轨迹动画结束，停止录制
             session.stopRecord()
         }
     }

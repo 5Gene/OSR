@@ -29,11 +29,24 @@ object OSR {
      */
     suspend fun recorder(context: Context, config: RecorderConfig): RecorderSession {
         OsrLog.i("recorder(config) output=${config.outputConfig.file?.absolutePath}")
+        applyVideoDefaults(context, config)
         validate(config)
         OsrLog.i("config validated, creating session")
         val session = config.renderStrategy!!.createSession(context, config)
         OsrLog.i("session created")
         return session
+    }
+
+    /** 宽高/dpi 为 0 时用屏幕像素与设备 dpi 填入 */
+    private fun applyVideoDefaults(context: Context, config: RecorderConfig) {
+        val dm = context.resources.displayMetrics
+        val v = config.videoConfig
+        if (v.width <= 0) v.width = dm.widthPixels
+        if (v.height <= 0) v.height = dm.heightPixels
+        if (v.densityDpi <= 0) v.densityDpi = dm.densityDpi
+        OsrLog.i(
+            "🎬 video defaults ${v.width}x${v.height} dpi=${v.densityDpi} strictAvc=${v.strictAvcLevel41}"
+        )
     }
 
     /** 参数校验，避免脏配置进入策略层 */
@@ -54,6 +67,12 @@ object OSR {
         require(config.videoConfig.fps > 0) {
             "帧率必须大于 0"
         }
-        OsrLog.d("validate passed ${config.videoConfig.width}x${config.videoConfig.height} ${config.videoConfig.fps}fps")
+        require(config.videoConfig.densityDpi > 0) {
+            "densityDpi 必须大于 0"
+        }
+        OsrLog.d(
+            "validate passed ${config.videoConfig.width}x${config.videoConfig.height} " +
+                "${config.videoConfig.fps}fps dpi=${config.videoConfig.densityDpi}"
+        )
     }
 }

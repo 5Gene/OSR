@@ -94,8 +94,8 @@ class MainActivity : AppCompatActivity() {
             try {
                 val newSession = OSR.recorder(applicationContext) {
                     video {
-                        width = 1080
-                        height = 1920
+                        // width/height/dpi 默认屏幕 + 设备 dpi；关掉 MaxFS 强缩以冲高清
+                        strictAvcLevel41 = false
                         fps = 30
                         bitrate = 4_000_000
                     }
@@ -128,19 +128,19 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     }
-//                    presentation { display, session ->
-//                        MapTrackPresentation(this@MainActivity, display, session)
-////                        ColorChangePresentation(this@MainActivity, display, session)
-//                    }
-                    fbo {
-                        view { session ->
-                            ColorChangeView(this@MainActivity).apply {
-                                onStart = { session.startRecord() }
-                                onEnd = { session.stopRecord() }
-                                start()
-                            }
-                        }
+                    presentation { display, session ->
+                        MapTrackPresentation(this@MainActivity, display, session)
+//                        ColorChangePresentation(this@MainActivity, display, session)
                     }
+//                    fbo {
+//                        view { session ->
+//                            ColorChangeView(this@MainActivity).apply {
+//                                onStart = { session.startRecord() }
+//                                onEnd = { session.stopRecord() }
+//                                start()
+//                            }
+//                        }
+//                    }
                 }
                 recorderSession = newSession
             } catch (e: Exception) {

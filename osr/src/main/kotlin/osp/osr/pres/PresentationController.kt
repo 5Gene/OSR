@@ -1,8 +1,10 @@
 package osp.osr.pres
 
 import android.app.Presentation
+import android.content.res.Resources
 import android.os.Handler
 import android.os.Looper
+import android.util.DisplayMetrics
 import android.view.Display
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -30,6 +32,15 @@ internal class PresentationController(
             val p = factory(display, session)
             p.show()
             presentation = p
+            val presDm = p.resources.displayMetrics
+            val displayDm = DisplayMetrics().also { display.getMetrics(it) }
+            val sysDm = Resources.getSystem().displayMetrics
+            // 对照：若 Presentation/Display 仍是 System 的 densityDpi，说明 VD 密度未生效 → 易「放大」
+            OsrLog.i(
+                "📺 density check Presentation=${presDm.widthPixels}x${presDm.heightPixels}@${presDm.densityDpi} " +
+                    "Display=${displayDm.widthPixels}x${displayDm.heightPixels}@${displayDm.densityDpi} " +
+                    "System=${sysDm.widthPixels}x${sysDm.heightPixels}@${sysDm.densityDpi}"
+            )
             OsrLog.d("Presentation shown")
         }
     }

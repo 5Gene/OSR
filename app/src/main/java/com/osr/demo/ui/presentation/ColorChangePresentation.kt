@@ -3,16 +3,16 @@ package com.osr.demo.ui.presentation
 import android.app.Presentation
 import android.os.Bundle
 import android.view.Display
+import androidx.appcompat.app.AppCompatActivity
 import com.osr.demo.ui.components.ColorChangeView
 import osp.osr.RecorderSession
-import androidx.appcompat.app.AppCompatActivity
 
 /**
- * 用于录制的 Presentation：使用 [ColorChangeView] 循环刷新背景色（约 30fps、5 秒），
- * 通过开始/结束回调驱动 [RecorderSession] 的 startRecord/stopRecord。
+ * 用于录制的 Presentation：静态挂上 ColorChangeView，
+ * startRecord 后等第一帧再开变色循环；结束时 stopRecord。
  */
 class ColorChangePresentation(
-    private val activity: AppCompatActivity,
+    activity: AppCompatActivity,
     display: Display,
     private val session: RecorderSession
 ) : Presentation(activity, display) {
@@ -22,10 +22,10 @@ class ColorChangePresentation(
         val content = ColorChangeView(context).apply {
             fps = 30
             durationSeconds = 5
-            onStart = { session.startRecord() }
             onEnd = { session.stopRecord() }
         }
         setContentView(content)
-        content.start()
+        // 先静态首屏；第一帧进文件后再 content.start() 开变色（勿在 onCreate 提前 start）
+        session.startRecord(onReady = { content.start() })
     }
 }

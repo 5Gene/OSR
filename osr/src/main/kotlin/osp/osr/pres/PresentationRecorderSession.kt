@@ -1,15 +1,20 @@
 package osp.osr.pres
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import osp.osr.RecorderSession
 import osp.osr.core.audio.AudioMixer
 import osp.osr.core.encoder.EncoderController
+import osp.osr.core.encoder.virtualDisplayDensityDpi
 import osp.osr.core.muxer.MuxerController
 import osp.osr.core.util.PtsNormalizer
 import osp.osr.core.util.SessionNotifier
@@ -29,7 +34,7 @@ import java.util.concurrent.atomic.AtomicReference
  * 用 [AtomicReference] + CAS 做合法状态转换，避免重复 start/stop、未 prepare 就 start 等非法调用。
  */
 internal class PresentationRecorderSession(
-    context: Context,
+    private val context: Context,
     private val config: RecorderConfig,
     private val presentationFactory: PresentationFactory
 ) : RecorderSession {
@@ -61,18 +66,33 @@ internal class PresentationRecorderSession(
         checkAndTransition(RecorderState.IDLE, RecorderState.PREPARED)
 
         try {
-            val surface = encoderController.prepare()
-            OsrLog.d("encoder surface ready")
+            encoderController.prepare()
+            OsrLog.d("encoder surface ready ${config.videoConfig.width}x${config.videoConfig.height}")
             muxerController.prepare()
             OsrLog.d("muxer ready")
             audioMixer?.prepare()
             OsrLog.d("audioMixer prepared (optional)")
 
-            val display = displayManager.createDisplay(surface, config.videoConfig)
-            OsrLog.d("VirtualDisplay ready")
+            val encodeW = config.videoConfig.width
+            val screenW = encoderController.requestedWidth
+            val densityDpi = virtualDisplayDensityDpi(
+                deviceDpi = config.videoConfig.densityDpi,
+                encodeW = encodeW,
+                screenW = screenW
+            )
+            OsrLog.i(
+                "📏 dpi baseDpi=${config.videoConfig.densityDpi} encodeW=$encodeW screenW=$screenW → densityDpi=$densityDpi"
+            )
+            // surface=null：等 codec.start() 后再绑（见 startRecord 握手）
+            val display = displayManager.createDisplay(
+                surface = null,
+                videoConfig = config.videoConfig,
+                densityDpi = densityDpi
+            )
+            OsrLog.d("🖥️ VirtualDisplay ready densityDpi=$densityDpi")
             presentationController.show(display, this)
             delay(PRESENTATION_SETTLE_MS)
-            OsrLog.i("prepare done PREPARED")
+            OsrLog.i("✅ prepare done PREPARED encode=${config.videoConfig.width}x${config.videoConfig.height}")
         } catch (e: Exception) {
             OsrLog.e("prepare failed output=$outputPath", e)
             state.set(RecorderState.RELEASED)
@@ -83,9 +103,9 @@ internal class PresentationRecorderSession(
     }
 
     /**
-     * ▶️ startRecord：此时再 encoder.start() + 启动编码循环，首帧就是「开始录制」时的画面。
+     * ▶️ startRecord：codec.start + 编码循环后，reattach VD，等第一帧再 [onReady] / onStart。
      */
-    override fun startRecord() {
+    override fun startRecord(onReady: (() -> Unit)?) {
         OsrLog.i("startRecord PREPARED -> RECORDING")
         checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
 
@@ -108,7 +128,29 @@ internal class PresentationRecorderSession(
                     )
                 }
             )
-            notifier.notifyStart()
+
+            // 🙈 旧写法：start + 开编码循环后立刻 onStart，UI 只能 sleep 1 秒猜「是不是可以演戏了」。
+            // 🎬 Muxer 要等 FORMAT_CHANGED 才开门，之前的帧全进垃圾桶；格式有了也不等于有画面
+            //    （ColorOS 可以「格式到手、像素为零」）。动画开早了缺开头，开晚了片头发呆。
+            // ✅ 等到第一帧真画面（不是 SPS 那种 CODEC_CONFIG）再主线程 onReady 开动画 + notifyStart。
+            // notifier.notifyStart()
+            recorderScope.launch {
+                try {
+                    handshakeUntilFirstFrame()
+                    withContext(Dispatchers.Main.immediate) {
+                        onReady?.invoke()
+                        notifier.notifyStart()
+                        OsrLog.i("🎉 onReady+onStart")
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    OsrLog.e("💀 startRecord handshake failed", e)
+                    state.set(RecorderState.RELEASED)
+                    releaseResources()
+                    notifier.notifyError(wrapError(e))
+                }
+            }
         } catch (e: Exception) {
             OsrLog.e("startRecord failed", e)
             state.set(RecorderState.RELEASED)
@@ -116,6 +158,24 @@ internal class PresentationRecorderSession(
             notifier.notifyError(wrapError(e))
             throw e
         }
+    }
+
+    /** 最多 3 轮：绑 → 50ms → 解绑再绑 → 等第一帧 1200ms */
+    private suspend fun handshakeUntilFirstFrame() {
+        val surface = encoderController.surface
+        repeat(REATTACH_ROUNDS) { round ->
+            currentCoroutineContext().ensureActive()
+            OsrLog.d("🤝 VD reattach round=${round + 1}/$REATTACH_ROUNDS")
+            displayManager.setSurface(surface)
+            delay(REATTACH_SETTLE_MS)
+            displayManager.setSurface(null)
+            displayManager.setSurface(surface)
+            if (encoderController.awaitFirstVideoFrame(FIRST_FRAME_TIMEOUT_MS)) {
+                OsrLog.i("🎉 first frame ready round=${round + 1}")
+                return
+            }
+        }
+        throw RecorderError.EncoderError("3 轮 reattach 后仍无第一帧")
     }
 
     /**
@@ -130,18 +190,14 @@ internal class PresentationRecorderSession(
 
         recorderScope.launch {
             try {
-                // 📤 告诉编码器：Surface 不会再上新帧了。编码器会把剩余帧编完，最后一帧带 EOS 标志。
-                // 效果：EncoderController 的 while 里会收到 BUFFER_FLAG_END_OF_STREAM → break → finally 里 done.complete(Unit)。
                 encoderController.signalEndOfStream()
                 OsrLog.d("signalEndOfStream sent, waiting encoder done")
                 encoderController.done.await()
                 OsrLog.d("encoder done")
 
-                // 🔇 停掉音频协程（cancel + join），避免再往 Muxer 写音频。
                 audioMixer?.stopMixing()
                 OsrLog.d("audio mixing stopped")
 
-                // 📀 写 moov 等索引，MP4 才完整可播。stop 之后不能再 writeSampleData，所以必须放在最后。
                 muxerController.stop()
                 OsrLog.i("muxer stopped")
 
@@ -174,7 +230,6 @@ internal class PresentationRecorderSession(
 
     /**
      * 🧹 按依赖逆序释放，避免悬空引用：先关 Presentation（不再画）→ 再 VirtualDisplay → Encoder → Audio → Muxer → 最后 cancel 协程。
-     * 效果：EncoderLoop、AudioMixer 协程被取消；codec/extractor/muxer 全部 release，文件句柄关闭。
      */
     private fun releaseResources() {
         OsrLog.d("releaseResources start")
@@ -188,7 +243,6 @@ internal class PresentationRecorderSession(
         OsrLog.i("releaseResources done")
     }
 
-    /** 🚦 CAS 状态转换：只有当前是 expected 才改成 next，否则抛错（防止重复 start、未 prepare 就 start 等）。 */
     private fun checkAndTransition(expected: RecorderState, next: RecorderState) {
         if (!state.compareAndSet(expected, next)) {
             OsrLog.e("invalid state transition expected=$expected actual=${state.get()}")
@@ -206,5 +260,8 @@ internal class PresentationRecorderSession(
     companion object {
         /** ⏱️ Presentation show 后等多长时间再认为首帧稳定；约 2～3 个 Vsync */
         private const val PRESENTATION_SETTLE_MS = 100L
+        private const val REATTACH_ROUNDS = 3
+        private const val REATTACH_SETTLE_MS = 50L
+        private const val FIRST_FRAME_TIMEOUT_MS = 1200L
     }
 }

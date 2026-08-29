@@ -13,8 +13,13 @@ import osp.osr.model.RecorderState
  */
 interface RecorderSession {
 
-    /** 🟢 开始录制（由用户在 Presentation 等 UI 中按需调用） */
-    fun startRecord()
+    /**
+     * 🟢 开始录制。
+     *
+     * @param onReady 第一帧可写视频数据到达后在主线程回调（Presentation 里在此开动画）；
+     *                null 表示不需要额外 UI 动作，仍会触发 listener.onStart。
+     */
+    fun startRecord(onReady: (() -> Unit)? = null)
 
     /** 🔴 停止录制并完成写入（含音频混合） */
     fun stopRecord()

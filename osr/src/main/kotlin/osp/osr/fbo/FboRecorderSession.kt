@@ -2,11 +2,13 @@ package osp.osr.fbo
 
 import android.content.Context
 import android.view.View
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import osp.osr.RecorderSession
 import osp.osr.core.audio.AudioMixer
 import osp.osr.core.encoder.EncoderController
@@ -80,7 +82,7 @@ internal class FboRecorderSession(
 
             // 编码器先 prepare，拿到 InputSurface，后面 FrameCaptureRenderer 画的内容就是进这个 Surface
             val surface = encoderController.prepare()
-            OsrLog.i("FboSession: encoder surface ready")
+            OsrLog.i("FboSession: 🖼️ encoder surface ready ${config.videoConfig.width}x${config.videoConfig.height}")
             muxerController.prepare()
             OsrLog.i("FboSession: muxer ready")
             audioMixer?.prepare()
@@ -147,9 +149,9 @@ internal class FboRecorderSession(
 
     /**
      * ▶️ 开始录：先让 FrameCaptureRenderer 在 GL 侧建好 FBO/编码器 Surface，再启动编码循环和帧源。
-     * 之后每一帧由 FrameSource 驱动 captureFrame()，编码器 dequeue 到的数据在 onFrame 里写 Muxer。
+     * 与 Presentation 一致：等第一帧 sample 后再主线程 [onReady] + onStart（无 VD reattach）。
      */
-    override fun startRecord() {
+    override fun startRecord(onReady: (() -> Unit)?) {
         OsrLog.i("FboSession: startRecord PREPARED -> RECORDING")
         checkAndTransition(RecorderState.PREPARED, RecorderState.RECORDING)
 
@@ -176,7 +178,26 @@ internal class FboRecorderSession(
 
             // 帧源开始「产帧」；例如 CaptureRendererSource 里 recording=true，onDrawFrame 里就会 captureFrame()
             frameSource?.start()
-            notifier.notifyStart()
+
+            scope.launch {
+                try {
+                    if (!encoderController.awaitFirstVideoFrame(FIRST_FRAME_TIMEOUT_MS)) {
+                        throw RecorderError.EncoderError("FBO 等待第一帧超时")
+                    }
+                    withContext(Dispatchers.Main.immediate) {
+                        onReady?.invoke()
+                        notifier.notifyStart()
+                        OsrLog.i("FboSession: 🎉 onReady+onStart")
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    OsrLog.e("FboSession: 💀 first-frame wait failed", e)
+                    state.set(RecorderState.RELEASED)
+                    releaseResources()
+                    notifier.notifyError(wrapError(e))
+                }
+            }
         } catch (e: Exception) {
             OsrLog.e("FboSession: startRecord failed", e)
             state.set(RecorderState.RELEASED)
@@ -254,4 +275,9 @@ internal class FboRecorderSession(
 
     private fun wrapError(e: Exception): RecorderError =
         if (e is RecorderError) e else RecorderError.EncoderError("FBO录制异常", e)
+
+    companion object {
+        /** 与 Presentation 三轮超时同量级，无 VD reattach */
+        private const val FIRST_FRAME_TIMEOUT_MS = 3600L
+    }
 }
