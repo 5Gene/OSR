@@ -177,8 +177,8 @@ internal class FboRecorderSession(
     }
 
     private fun startRecordNow(onReady: (() -> Unit)?) {
-        // 方式 1/2：必须在 GL 线程调 initGL；方式 3/4 在 ViewSource/OffscreenSource 协程里 makeCurrent 后再调
-        if (!isOffscreenMode) captureRenderer?.initGL()
+        // 方式 1/2：禁止在此（非 GL）线程 initGL，改由 FrameCaptureRenderer.captureFrame 在宿主 GL 线程懒初始化
+        // 方式 3/4：仍由 ViewSource/OffscreenSource 在 makeCurrent 后显式调 glInit，行为不变
 
         encoderController.start()
         encoderController.launchEncoderLoop(

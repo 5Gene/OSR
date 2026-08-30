@@ -27,7 +27,8 @@ class MapTrackView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : FrameLayout(context, attrs, defStyleAttr) {
 
-    private val mapView: MapView
+    /** FBO 录制等外部挂载 CustomRenderer 时需要访问 MapView */
+    internal val mapView: MapView
     private val distanceTextView: TextView
 
     /** 顶部全屏封面，地图加载完成后 1s 渐变隐藏 */
@@ -41,6 +42,10 @@ class MapTrackView @JvmOverloads constructor(
     private var totalDistance = 0f
     private var mapLoadedListener: OnMapLoadedListener? = null
     private var animationListener: OnAnimationEndListener? = null
+
+    /** 是否已加载完成，避免 FBO 录制时错过 setOnMapLoadedListener */
+    var isMapLoaded = false
+        private set
 
     /** 地图加载完成回调，供外部使用 */
     fun interface OnMapLoadedListener {
@@ -67,6 +72,7 @@ class MapTrackView @JvmOverloads constructor(
             }
             map.mapType = AMap.MAP_TYPE_SATELLITE
             map.setOnMapLoadedListener {
+                isMapLoaded = true
                 mapLoadedListener?.onMapLoaded()
                 // 地图加载完成后 1s 渐变隐藏封面
                 mainHandler.postDelayed({
@@ -76,6 +82,7 @@ class MapTrackView @JvmOverloads constructor(
                         .withEndAction { coverView.visibility = View.GONE }
                 }, 1000)
             }
+            // 占位 CustomRenderer；FBO2 录制时会被 MapTrackFboRecorder 替换为捕获链路
             map.setCustomRenderer(object : CustomRenderer {
                 override fun OnMapReferencechanged() {
                     println("CustomRenderer => OnMapReferencechanged ")

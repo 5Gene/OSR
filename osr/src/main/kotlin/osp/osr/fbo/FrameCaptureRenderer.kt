@@ -76,9 +76,11 @@ class FrameCaptureRenderer(
 
     /**
      * 🛠️ 在 GL 线程里调用一次，创建 FBO、编码器 EGL Surface、滤镜管线、全屏 program。
-     * 谁调我：FboRecorderSession.startRecord() 里，在 frameSource.start() 之前调一次。
+     * 谁调我：方式 3/4 由 ViewSource/OffscreenSource 在 makeCurrent 后显式调用；
+     * 方式 1/2 由 [captureFrame] 在宿主 GL 线程懒加载调用（必须已有 active EGL Context）。
      */
     fun initGL() {
+        if (initialized) return
         OsrLog.i("FrameCaptureRenderer: initGL start ${width}x${height}, skipEglRestore=$skipEglRestore")
         checkGles30Support()
 
@@ -111,6 +113,14 @@ class FrameCaptureRenderer(
      * 谁调我：各 FrameSource 在「每帧画完」的时机调，例如 CaptureRendererSource.onDrawFrame、GLSurfaceViewSource.onDrawFrame。
      */
     override fun captureFrame() {
+        // 方式 1/2：必须在宿主 GL 线程懒初始化，避免在 Default 线程无 EGL Context 时创建资源失败
+        if (!initialized) {
+            synchronized(this) {
+                if (!initialized) {
+                    initGL()
+                }
+            }
+        }
         if (!initialized || !recording) return
 
         val hostDisplay: EGLDisplay
