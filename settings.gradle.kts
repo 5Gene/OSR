@@ -11,9 +11,12 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
+
 plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
+    id("io.github.5hmlA.vcl") version "2026.08.29"
 }
+
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
@@ -23,6 +26,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "OSC"
+rootProject.name = "OSR"
 include(":app")
-include(":osc")
+include(":osr")
