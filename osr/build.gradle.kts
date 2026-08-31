@@ -39,3 +39,8 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }
+
+group = GroupIdMavenCentral
+version = libs.versions.gene.osr.get()
+
+publishMavenCentral("offscreen recorder")
