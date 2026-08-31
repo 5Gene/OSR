@@ -29,8 +29,19 @@ class EncoderController(private val videoConfig: VideoConfig) {
     private var codec: MediaCodec? = null
     private var inputSurface: Surface? = null
 
-    /** clamp 前用户请求的宽，供 VD 密度缩放用 */
+    /**
+     * 📏 clamp / MaxFS 缩小**之前**用户要的宽（通常=屏幕宽）。
+     * 为啥留着：VirtualDisplay 算 dpi 要用「编码宽 / 原屏宽」同比缩小，
+     * 以及 start 失败重配时要从「用户原始请求」再算一遍 MaxFS，不能拿已经对齐过的尺寸当原点。
+     */
     var requestedWidth: Int = 0
+        private set
+
+    /**
+     * 📏 同上，原始请求高。
+     * start 失败 → retry MaxFS 时和 [requestedWidth] 一起喂给 [prepareStrict]。
+     */
+    var requestedHeight: Int = 0
         private set
 
     /** ✅ 编码循环结束时 complete，stopRecord 里 await 它，确保所有帧都写完再 stop Muxer */
@@ -43,6 +54,15 @@ class EncoderController(private val videoConfig: VideoConfig) {
         get() = inputSurface ?: throw RecorderError.EncoderError("InputSurface 尚未创建")
 
     /**
+     * 📦 start() 的回执：有没有换过「画布」。
+     *
+     * [surfaceReplaced]=false：一次 start 就成功，外面啥都不用动。
+     * [surfaceReplaced]=true：旧 codec/Surface 已扔，宽高可能变小了——
+     *   Presentation 要 VD.resize；FBO 要 updateEncoderTarget，否则还往旧 Surface 上画。
+     */
+    class StartResult(val surfaceReplaced: Boolean)
+
+    /**
      * 🛠️ prepare：配好编码器 + 创建 InputSurface，**不** start。
      *
      * **为啥不在这 start**：Surface 要先绑给 VirtualDisplay、Presentation 先画几帧，再 start 才能录到内容。
@@ -52,6 +72,7 @@ class EncoderController(private val videoConfig: VideoConfig) {
         val reqW = videoConfig.width
         val reqH = videoConfig.height
         requestedWidth = reqW
+        requestedHeight = reqH
         OsrLog.i(
             "🎬 encoder prepare request ${reqW}x${reqH} fps=${videoConfig.fps} " +
                 "bitrate=${videoConfig.bitrate} strictAvc=${videoConfig.strictAvcLevel41}"
@@ -69,9 +90,7 @@ class EncoderController(private val videoConfig: VideoConfig) {
 
         // 🎯 得到「编码器的输入 Surface」：谁往这个 Surface 上画，编码器就编谁。VirtualDisplay 会绑定它。
         // 效果：之后 start() 一调，编码器就会开始从 Surface 取帧并输出 H.264。
-        inputSurface = encoder.createInputSurface()
-        codec = encoder
-        firstVideoFrame = CompletableDeferred()
+        bindConfigured(encoder)
         OsrLog.i("🖼️ InputSurface ready ${videoConfig.width}x${videoConfig.height}")
         return inputSurface!!
     }
@@ -114,25 +133,60 @@ class EncoderController(private val videoConfig: VideoConfig) {
         videoConfig.height = height
     }
 
+    /**
+     * 🧩 按宽高建 AVC 编码器并 configure（还不 start）。
+     *
+     * 对照谷歌 EncodeAndMuxTest / MediaFormat 文档，Surface 编码最少要这几项：
+     * MIME + 宽高 + COLOR_FormatSurface + BIT_RATE + FRAME_RATE + I_FRAME_INTERVAL，
+     * 再 configure(..., CONFIGURE_FLAG_ENCODE)。键集合与官方一致。
+     */
     private fun createAndConfigure(width: Int, height: Int): MediaCodec? {
+        // 📊 码率：外部 bitrate>0 用用户值；默认 0 则 3*w*h（随分辨率自动估，不用懂 Mbps）
+        // 例：1280×720 → ~2.8Mbps；976×2128 → ~6.2Mbps。越大画质越好、文件也越大。
+        val bitRate = if (videoConfig.bitrate > 0) {
+            videoConfig.bitrate
+        } else {
+            3 * width * height
+        }
+
+        // 🎬 createVideoFormat(mime, w, h)：
+        // - mime=video/avc → H.264，设备兼容最好（HEVC 另说）
+        // - w/h = 编码画布像素；决定缓冲大小与清晰度（已是 align/MaxFS 后的最终值）
         val format = MediaFormat.createVideoFormat(
             MediaFormat.MIMETYPE_VIDEO_AVC,
             width,
             height
         ).apply {
+            // 🖼️ 颜色格式：COLOR_FormatSurface = 从 Surface 吃帧（VirtualDisplay / FBO 画上去）
+            //    不是 CPU 塞 YUV ByteBuffer。谷歌 Surface 录制示例固定写这个。
+            //    写错成 YUV Flexible 就没法 createInputSurface() 那套路。
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, videoConfig.bitrate)
+
+            // 💰 目标平均码率（bps）。影响画质 vs 体积；码控会尽量靠近这个数。
+            //    不解决 NO_MEMORY——那是宽高/缓冲问题。可选进阶键 KEY_BITRATE_MODE 本库不设。
+            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+
+            // ⏱️ 帧率（fps）：编码器「码控参考」用的名义帧率，文档要求编码器必填。
+            //    本库真实出多少帧 = InputSurface 多久来一帧（Presentation 绘制节奏），
+            //    不是这个数字硬造帧。Demo 常用 30。
             setInteger(MediaFormat.KEY_FRAME_RATE, videoConfig.fps)
+
+            // 🔑 关键帧间隔，单位是「秒」不是「帧数」！（谷歌文档 / EncodeAndMuxTest 常用 10）
+            //    例：10 → 约每 10 秒一个 I 帧；0 → 几乎每帧都是关键帧（体积大、seek 细）。
+            //    短动画用 10 可能整段只有 1 个关键帧，seek 粗但文件小；要细 seek 可设 1～2。
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, videoConfig.iFrameInterval)
         }
 
-        // 按 MIME 拿系统编码器实例；还没 configure，不能 start。
+        // 按 MIME 拿系统硬编实例；还没 configure，不能 start，也不能 createInputSurface。
         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         return try {
-            // 进入 Configured 状态；第三个 null = 不用 Surface 做渲染，第四个 FLAG = 编码模式。
-            // 效果：可以接着 createInputSurface()，但还不能喂数据。
+            // configure(format, surface, crypto, flags)：
+            // - surface=null：编码输出不渲染到屏幕，我们自己 dequeue 写 Muxer
+            // - crypto=null：不加密
+            // - CONFIGURE_FLAG_ENCODE：这是编码器不是解码器
+            // 成功后才能 createInputSurface()；真正申请 ION 缓冲多半在 start()。
             encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            OsrLog.i("✅ configure OK ${width}x${height} bitrate=${videoConfig.bitrate} fps=${videoConfig.fps}")
+            OsrLog.i("✅ configure OK ${width}x${height} bitrate=$bitRate fps=${videoConfig.fps}")
             encoder
         } catch (e: MediaCodec.CodecException) {
             OsrLog.e("💥 configure CodecException ${width}x${height} code=0x${Integer.toHexString(e.errorCode)}", e)
@@ -146,14 +200,133 @@ class EncoderController(private val videoConfig: VideoConfig) {
     }
 
     /**
-     * ▶️ start：编码器开始工作，从 InputSurface 抓帧并编码。
+     * ▶️ start：编码器开机，从 InputSurface 抓帧并编码。
      *
-     * **效果**：内部输出队列里很快会有数据；launchEncoderLoop 里 dequeue 会先拿到 INFO_OUTPUT_FORMAT_CHANGED，
-     * 再拿到 CODEC_CONFIG（SPS/PPS），然后就是一帧一帧的 H.264。调用方下一步必须 launchEncoderLoop，否则队列会满。
+     * **效果**：输出队列很快会有数据；launchEncoderLoop 里 dequeue 会先拿到 INFO_OUTPUT_FORMAT_CHANGED，
+     * 再拿到 CODEC_CONFIG（SPS/PPS），然后就是一帧一帧的 H.264。下一步必须 launchEncoderLoop，否则队列会满。
+     *
+     * 🙈 旧坑：configure() 在很多手机上「嘴上答应」（日志 ✅ configure OK），真正按宽高去申请
+     *    硬件缓冲（ION/GraphicBuffer）是在 start() 里才干。整屏超大时就会：
+     *    MediaCodec: err 0xfffffff4/NO_MEMORY, state 5/STARTING
+     *    （0xfffffff4 = -12 = 底层说「内存/缓冲不够」，不是 Java 堆 OOM。）
+     *    降 bitrate 救不了——缓冲大小跟画布宽高走，不跟码率走。
+     *
+     * 🛟 兜底：start 一炸 → 扔掉坏掉的 codec + 旧 InputSurface →
+     *    若用户开的是 relaxed（strictAvc=false）：按原始请求再走一遍 MaxFS（=strict 那套）；
+     *    若已经是 strict：直接降 720p。
+     *    MaxFS 这档 start 还挂 → 再降 720p。全挂才抛给 Session。
+     *    换过 Surface 时返回 surfaceReplaced=true，外面必须跟着换 VD / FBO 目标。
      */
-    fun start() {
-        OsrLog.i("▶️ codec.start ${videoConfig.width}x${videoConfig.height}")
-        codec?.start() ?: throw RecorderError.EncoderError("MediaCodec 尚未准备")
+    fun start(): StartResult {
+        val beforeW = videoConfig.width
+        val beforeH = videoConfig.height
+        OsrLog.i("🎥 ▶️ codec.start ${beforeW}x${beforeH}")
+        val encoder = codec ?: throw RecorderError.EncoderError("MediaCodec 尚未准备")
+        try {
+            // 🟢 开心路径：开机成功，Surface 还是 prepare 时那块，外面不用动
+            encoder.start()
+            return StartResult(surfaceReplaced = false)
+        } catch (e: MediaCodec.CodecException) {
+            // 典型：NO_MEMORY(0xfffffff4)。codec 已废，不能原地再 start，只能重建
+            OsrLog.e(
+                "💥 codec.start CodecException ${beforeW}x${beforeH} code=0x${Integer.toHexString(e.errorCode)}",
+                e
+            )
+            return retryStartAfterFailure(fromRelaxed = !videoConfig.strictAvcLevel41)
+        } catch (e: Exception) {
+            OsrLog.e("💥 codec.start failed ${beforeW}x${beforeH}", e)
+            return retryStartAfterFailure(fromRelaxed = !videoConfig.strictAvcLevel41)
+        }
+    }
+
+    /**
+     * 🛟 start 挂了之后的「换小号画布再开机」。
+     *
+     * **小白流程**：
+     * 1. 旧编码器已经坏了 → [releaseCodecAndSurface] 连 InputSurface 一起扔（必须 release，否则泄漏）
+     * 2. fromRelaxed=true：用户本来想冲高清（只 16 对齐），现在退一步走 [prepareStrict]（压到 MaxFS≤8192 宏块）
+     * 3. fromRelaxed=false：prepare 时已经 MaxFS 过了，还 start 挂 → 只剩 720p 这张底牌
+     * 4. 新 configure + 新 createInputSurface + 再 start
+     * 5. MaxFS 档 start 仍挂（仅 fromRelaxed）→ 再来一轮 720p
+     *
+     * **为啥返回 surfaceReplaced=true**：新 Surface ≠ 旧 Surface。Presentation 的 VD、FBO 的 EGL
+     * 还握着旧的就会画空气 / 黑屏，所以 Session 看到 true 必须 resize / updateEncoderTarget。
+     */
+    private fun retryStartAfterFailure(fromRelaxed: Boolean): StartResult {
+        // 用原始请求宽高当原点（不是已经 align 过的），否则 MaxFS 缩放基准会偏
+        val reqW = requestedWidth.coerceAtLeast(videoConfig.width)
+        val reqH = requestedHeight.coerceAtLeast(videoConfig.height)
+        // 🛑 先清场。stopFirst=false：start 半截失败时 codec 可能不在 Started，stop 会再抛一次，忽略即可
+        releaseCodecAndSurface(stopFirst = false)
+
+        val encoder = if (fromRelaxed) {
+            OsrLog.w("🛟 start fail → retry MaxFS from ${reqW}x${reqH}")
+            // ♻️ 复用 prepareStrict：等比缩到 AVC 4.1 MaxFS，configure 再跪才内部降 720p
+            prepareStrict(reqW, reqH)
+        } else {
+            val (fbW, fbH) = fallback720p(videoConfig.width, videoConfig.height)
+            OsrLog.w("🛟 start fail (already MaxFS) → fallback 720p ${fbW}x${fbH}")
+            applySize(fbW, fbH)
+            createAndConfigure(fbW, fbH)
+                ?: throw RecorderError.EncoderError("MediaCodec.configure 失败（720p fallback）")
+        }
+        // 🆕 新 codec 必须重新 createInputSurface；旧的已经 release 了
+        bindConfigured(encoder)
+
+        try {
+            encoder.start()
+            OsrLog.i("🎥 ▶️ codec.start retry OK ${videoConfig.width}x${videoConfig.height}")
+            return StartResult(surfaceReplaced = true)
+        } catch (e: Exception) {
+            if (!fromRelaxed) {
+                // 已经是「strict 失败 → 720p」这条线，没有更小档了
+                throw RecorderError.EncoderError("MediaCodec.start 失败（含 720p）", e)
+            }
+            // 🪜 第二级台阶：MaxFS 尺寸 start 仍 NO_MEMORY → 硬降 720×1280 / 1280×720
+            OsrLog.e("💥 MaxFS start still fail, try 720p", e)
+            releaseCodecAndSurface(stopFirst = false)
+            val (fbW, fbH) = fallback720p(reqW, reqH)
+            applySize(fbW, fbH)
+            val fb = createAndConfigure(fbW, fbH)
+                ?: throw RecorderError.EncoderError("MediaCodec.configure 失败（720p fallback）")
+            bindConfigured(fb)
+            try {
+                fb.start()
+                OsrLog.i("🎥 ▶️ codec.start 720p OK ${fbW}x${fbH}")
+                return StartResult(surfaceReplaced = true)
+            } catch (e2: Exception) {
+                throw RecorderError.EncoderError("MediaCodec.start 失败（含 720p）", e2)
+            }
+        }
+    }
+
+    /**
+     * 🔗 把「已 configure 的编码器」挂到本类字段上，并造一块新的 InputSurface。
+     * prepare 成功路径、start 失败重配路径都会走这里，避免两处各写一遍 createInputSurface。
+     */
+    private fun bindConfigured(encoder: MediaCodec) {
+        inputSurface = encoder.createInputSurface()
+        codec = encoder
+        // 重配后第一帧要从头等，旧的 CompletableDeferred 可能已经 complete/cancel 过
+        firstVideoFrame = CompletableDeferred()
+    }
+
+    /**
+     * 🧹 关掉编码器 + 释放 InputSurface。
+     *
+     * ⚠️ Surface 一定要 release：只把引用置 null，系统侧 BufferQueue / 硬编实例可能还占着，
+     *    反复录制会越录越容易再撞 NO_MEMORY。
+     * [stopFirst]=true：正常收尾（release()）先 stop 再 release；
+     * [stopFirst]=false：start 失败重配时用，codec 可能还没真正 Started，stop 可省略。
+     */
+    private fun releaseCodecAndSurface(stopFirst: Boolean) {
+        if (stopFirst) {
+            runCatching { codec?.stop() }
+        }
+        runCatching { codec?.release() }
+        runCatching { inputSurface?.release() }
+        codec = null
+        inputSurface = null
     }
 
     /**
@@ -254,21 +427,12 @@ class EncoderController(private val videoConfig: VideoConfig) {
     }
 
     /**
-     * 🔌 停掉并释放编码器；release() 里会调，或异常时收尾。
-     * stop 清队列，release 关资源；之后 codec 不可再用。
+     * 🔌 停掉并释放编码器；Session.release / 异常收尾会调。
+     * 走 [releaseCodecAndSurface]，保证 InputSurface 也 release，避免硬编实例泄漏。
      */
     fun release() {
         OsrLog.d("🧹 encoder release")
-        try {
-            codec?.stop()
-        } catch (_: Exception) {
-        }
-        try {
-            codec?.release()
-        } catch (_: Exception) {
-        }
-        codec = null
-        inputSurface = null
+        releaseCodecAndSurface(stopFirst = true)
     }
 
     companion object {

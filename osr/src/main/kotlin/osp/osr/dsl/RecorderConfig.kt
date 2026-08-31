@@ -11,8 +11,12 @@ class VideoConfig {
     /** 0 = 填成屏幕高 */
     var height: Int = 0
     var fps: Int = 30
-    var bitrate: Int = 4_000_000
-    var iFrameInterval: Int = 1
+    /**
+     * 码率（bps）。0=未指定，configure 时用 `3*width*height` 按分辨率自动估；
+     * >0 则用该值。一般不用设。
+     */
+    var bitrate: Int = 0
+    var iFrameInterval: Int = 10
     /**
      * true：一开始就按 MaxFS=8192 纠正宽高再 configure
      * false：先只 16 对齐 configure；失败再 MaxFS 纠正写回并重配；仍失败才 720p
@@ -98,6 +102,7 @@ class RecorderConfig {
             config.videoConfig.fps = fps
         }
 
+        /** >0 覆盖自动码率；0 或未调用则 configure 用 3*w*h */
         fun setBitrate(bitrate: Int) = apply {
             config.videoConfig.bitrate = bitrate
         }

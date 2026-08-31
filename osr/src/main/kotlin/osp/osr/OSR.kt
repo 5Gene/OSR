@@ -61,8 +61,8 @@ object OSR {
         require(config.videoConfig.width > 0 && config.videoConfig.height > 0) {
             "视频宽高必须大于 0"
         }
-        require(config.videoConfig.bitrate > 0) {
-            "码率必须大于 0"
+        require(config.videoConfig.bitrate >= 0) {
+            "码率不能为负数（0=按分辨率自动估）"
         }
         require(config.videoConfig.fps > 0) {
             "帧率必须大于 0"

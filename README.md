@@ -127,7 +127,7 @@ lifecycleScope.launch {
             // width/height/dpi 可不写 → 屏幕像素 + 设备 dpi
             // strictAvcLevel41 = false  // 先 16 对齐冲高清；configure 失败再 MaxFS，再失败 720p
             fps = 30
-            bitrate = 4_000_000
+            // bitrate 默认 0 → 库内按 3*width*height 自动估；需要时可 bitrate = 4_000_000
         }
 
         output {
@@ -215,8 +215,8 @@ lifecycleScope.launch {
 | densityDpi       | VD 密度基准；`<=0` 时用设备 dpi；尺寸被缩小时仍按 encodeW/screenW 同比缩放      | 设备 dpi                 |
 | strictAvcLevel41 | `true`：先 MaxFS=8192 纠正；`false`：先 16 对齐，失败再 MaxFS，再失败 720p | true                   |
 | fps              | 帧率                                                        | 30                     |
-| bitrate          | 码率（bps）                                                   | 4_000_000              |
-| iFrameInterval   | 关键帧间隔（秒）                                                  | 1                      |
+| bitrate          | 码率（bps）；`0`=按 `3*宽*高` 自动估，`>0` 用该值                        | 0                      |
+| iFrameInterval   | 关键帧间隔（秒）                                                  | 10                     |
 | output file      | 输出 MP4 路径                                                 | 必填                     |
 | audio file       | 背景音文件（可选）                                                 | null                   |
 | renderStrategy   | 渲染策略                                                      | 必填（presentation / fbo） |

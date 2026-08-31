@@ -41,8 +41,10 @@ import osp.osr.log.OsrLog
  */
 
 class FrameCaptureRenderer(
-    private val width: Int,
-    private val height: Int,
+    /** 编码画布宽；start 失败重配后可能被 [updateEncoderTarget] 改小（须在 initGL 前） */
+    private var width: Int,
+    /** 编码画布高；同上 */
+    private var height: Int,
     encoderSurface: Surface,
     private val filterPipeline: FilterPipeline,
     private val skipEglRestore: Boolean = false,
@@ -72,7 +74,25 @@ class FrameCaptureRenderer(
     private var textureProgram: TextureProgram? = null
     private var eglSurfaceManager: EglSurfaceManager? = null
 
-    private val pendingEncoderSurface: Surface = encoderSurface
+    /** ⏳ 等 initGL 拿去建 EGL WindowSurface 的编码器 Surface；重配后会换成新的 */
+    private var pendingEncoderSurface: Surface = encoderSurface
+
+    /**
+     * 🔄 start 失败重配后、[initGL] 之前换「画到哪 / 画多大」。
+     *
+     * 小白版：prepare 时我们手里拿的是「大分辨率」那块 InputSurface；
+     * start 兜底后编码器换了小号 Surface，宽高也变了。
+     * initGL 会用 pendingEncoderSurface 建 EGL WindowSurface、用 width/height 建 FBO——
+     * 所以必须在 initGL **之前**改掉，否则还往已 release 的旧 Surface 上画 → 黑屏/崩溃。
+     * initGL 做过了就不能换（EGL/FBO 已经按旧尺寸建好），会直接 check 挂掉。
+     */
+    fun updateEncoderTarget(surface: Surface, width: Int, height: Int) {
+        check(!initialized) { "initGL 之后不能换 encoder Surface" }
+        pendingEncoderSurface = surface
+        this.width = width
+        this.height = height
+        OsrLog.w("🛟 FBO encoder target ${width}x${height}")
+    }
 
     /**
      * 🛠️ 在 GL 线程里调用一次，创建 FBO、编码器 EGL Surface、滤镜管线、全屏 program。

@@ -59,6 +59,14 @@ internal class PresentationRecorderSession(
 
     /**
      * 🛠️ prepare：搭好管线（encoder/muxer/display/show），完成后才进入 PREPARED 并放行 startRecord。
+     *
+     * 🙈 旧坑：先按整屏建 VD + show，MapView 已按大画布 layout/GL 初始化；
+     *    之后 startRecord 里 codec.start() 才因 NO_MEMORY 降到 MaxFS，再 VD.resize →
+     *    旧大布局投到小画布，地图裁切、文字相对放大。
+     * ✅ 先 start（含 MaxFS/720p 兜底）拿到最终宽高，再按最终尺寸建 VD 并 show，
+     *    MapTrackView 第一次初始化就是正确尺寸/density，无需运行中 resize。
+     * 📎 InputSurface 在 prepare/start 时已 create（必须在 start 前），但 VD 仍 surface=null；
+     *    UI startRecord 后 handshake 才 setSurface，show 阶段不会往编码器送帧。
      */
     suspend fun prepare() {
         val outputPath = config.outputConfig.file?.absolutePath ?: ""
@@ -74,6 +82,16 @@ internal class PresentationRecorderSession(
             audioMixer?.prepare()
             OsrLog.d("audioMixer prepared (optional)")
 
+            // 🎥 在 show 前开机：NO_MEMORY 时内部 MaxFS/720p 重配，宽高写回 videoConfig
+            // 此时还没有 VD/Presentation，不用处理 surfaceReplaced
+            encoderController.start()
+            OsrLog.i(
+                "🎥 encoder started before Presentation request=" +
+                    "${encoderController.requestedWidth}x${encoderController.requestedHeight} " +
+                    "final=${config.videoConfig.width}x${config.videoConfig.height}"
+            )
+
+            // ⚠️ encodeW 必须在 start 之后读，否则拿到的是降档前的尺寸
             val encodeW = config.videoConfig.width
             val screenW = encoderController.requestedWidth
             val densityDpi = virtualDisplayDensityDpi(
@@ -84,7 +102,7 @@ internal class PresentationRecorderSession(
             OsrLog.i(
                 "📏 dpi baseDpi=${config.videoConfig.densityDpi} encodeW=$encodeW screenW=$screenW → densityDpi=$densityDpi"
             )
-            // surface=null：等 codec.start() 后再绑（见 startRecord 握手）
+            // surface=null：等 UI startRecord 握手再绑 InputSurface（见 handshakeUntilFirstFrame）
             val display = displayManager.createDisplay(
                 surface = null,
                 videoConfig = config.videoConfig,
@@ -132,8 +150,14 @@ internal class PresentationRecorderSession(
         }
     }
 
+    /**
+     * ▶️ prepare 已把编码器 start 好了；这里只开输出循环 + 把 InputSurface 绑到 VD。
+     *
+     * 不再二次 codec.start()，也不再 VD.resize——降档已在 prepare/show 前完成，
+     * Presentation/MapView 已按最终尺寸初始化。
+     * 🤝 handshake：VD 从 surface=null → 绑 encoder InputSurface（真正开始送帧）。
+     */
     private fun startRecordNow(onReady: (() -> Unit)?) {
-        encoderController.start()
         encoderController.launchEncoderLoop(
             scope = recorderScope,
             onFormatChanged = { format ->
@@ -156,7 +180,6 @@ internal class PresentationRecorderSession(
         // 🎬 Muxer 要等 FORMAT_CHANGED 才开门，之前的帧全进垃圾桶；格式有了也不等于有画面
         //    （ColorOS 可以「格式到手、像素为零」）。动画开早了缺开头，开晚了片头发呆。
         // ✅ 等到第一帧真画面（不是 SPS 那种 CODEC_CONFIG）再主线程 onReady 开动画 + notifyStart。
-        // notifier.notifyStart()
         recorderScope.launch {
             try {
                 handshakeUntilFirstFrame()
@@ -199,10 +222,15 @@ internal class PresentationRecorderSession(
      *
      * **为什么必须等 encoder done 再 stop Muxer**：Muxer.stop() 会写 moov 等索引，一旦 stop 就不能再 writeSampleData；
      * 若编码器还在往 Muxer 写帧，会乱套或丢帧。所以先 signalEndOfStream，等 EncoderLoop 里收到 EOS 并 break，done 才 complete。
+     *
+     * **幂等**：Demo 常「按钮停 + 动画 onEnd 再停」。非 RECORDING（已 STOPPING/RELEASED）直接 return，避免炸。
      */
     override fun stopRecord() {
+        if (!state.compareAndSet(RecorderState.RECORDING, RecorderState.STOPPING)) {
+            OsrLog.w("stopRecord ignored, state=${state.get()} (need RECORDING)")
+            return
+        }
         OsrLog.i("stopRecord RECORDING -> STOPPING lastPts=${ptsNormalizer.lastPts}us")
-        checkAndTransition(RecorderState.RECORDING, RecorderState.STOPPING)
 
         recorderScope.launch {
             try {

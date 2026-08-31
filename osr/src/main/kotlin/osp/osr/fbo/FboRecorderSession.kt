@@ -180,7 +180,16 @@ internal class FboRecorderSession(
         // 方式 1/2：禁止在此（非 GL）线程 initGL，改由 FrameCaptureRenderer.captureFrame 在宿主 GL 线程懒初始化
         // 方式 3/4：仍由 ViewSource/OffscreenSource 在 makeCurrent 后显式调 glInit，行为不变
 
-        encoderController.start()
+        // 🎥 开机；NO_MEMORY 时内部会换成 MaxFS/720p 的新 InputSurface
+        val result = encoderController.start()
+        if (result.surfaceReplaced) {
+            // 🛟 必须在 frameSource.start() / 懒 initGL 之前换目标，否则 EGL 绑到已 release 的旧 Surface
+            captureRenderer?.updateEncoderTarget(
+                encoderController.surface,
+                config.videoConfig.width,
+                config.videoConfig.height
+            )
+        }
         encoderController.launchEncoderLoop(
             scope = scope,
             onFormatChanged = { format ->
@@ -224,9 +233,15 @@ internal class FboRecorderSession(
     /**
      * ⏹️ 停止录：先停帧源和 capture，再让编码器收 EOS，等编码循环结束，停音频，最后 stop Muxer，通知 onStop/onSaved。
      */
+    /**
+     * ⏹️ 停录。非 RECORDING（已 STOPPING/RELEASED）直接 return，避免按钮与 onEnd 双停炸状态机。
+     */
     override fun stopRecord() {
+        if (!state.compareAndSet(RecorderState.RECORDING, RecorderState.STOPPING)) {
+            OsrLog.w("FboSession: stopRecord ignored, state=${state.get()} (need RECORDING)")
+            return
+        }
         OsrLog.i("FboSession: stopRecord RECORDING -> STOPPING lastPts=${ptsNormalizer.lastPts}us")
-        checkAndTransition(RecorderState.RECORDING, RecorderState.STOPPING)
 
         scope.launch {
             try {
